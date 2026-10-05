@@ -57,3 +57,27 @@ class ModelMismatchError(ProviderError):
 
     A silent substitution must block the benchmark rather than be scored.
     """
+
+
+class BudgetExceeded(BenchmarkError):
+    """A paid dispatch was refused because the conservative exposure guard would
+    be breached.
+
+    Carries the exposure that would result and the shared cap so the runner can
+    stop cleanly, record why, and leave completed work intact and billable only
+    once. Deliberately *not* a :class:`ProviderError`, so the two-stage workflow
+    does not swallow it as a per-stage outcome; it propagates up to stop the run.
+    """
+
+    def __init__(self, message: str, *, exposure: float, cap: float) -> None:
+        super().__init__(message)
+        self.exposure = exposure
+        self.cap = cap
+
+
+class RunIdentityError(BenchmarkError):
+    """A resume target does not match the current dataset/task specification.
+
+    Reusing results from a different dataset or frozen specification would
+    silently mix incompatible experiments, so resume refuses instead.
+    """

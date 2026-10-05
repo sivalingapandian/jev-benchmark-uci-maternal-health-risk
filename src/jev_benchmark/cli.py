@@ -12,7 +12,18 @@ Subcommands available in this milestone:
   OpenRouter models with the shared two-stage task, validate each response, and
   record redacted model/schema/usage before any bulk run (needs API keys).
 
-Pilot/run/report subcommands are added by later milestones.
+* ``pilot`` - run the two-stage workflow for a small real sample across all
+  three providers, record schema/usage/errors and timing, and project a
+  conservative full-run cost to decide whether the full run fits the shared
+  ``$20`` budget (needs API keys).
+
+* ``run`` - sequential, budgeted, resumable measured run over the prespecified
+  rows for all three providers. Refuses to start a full-population run without
+  an affordable pilot projection, and stops before the shared cap (needs keys).
+
+* ``run-inspect`` - offline summary of a saved run/pilot directory: outcome
+  counts, conservative accounting, latency p50/p95 at both scopes, and whether
+  the run is complete (no paid requests).
 """
 
 from __future__ import annotations
@@ -24,10 +35,14 @@ import os
 import sys
 from pathlib import Path
 
-from . import spec
+from . import pilot as pilot_mod
+from . import runinspect, runner, spec
+from .budget import CAP_USD, BudgetLedger
 from .dataset import PreparedDataset, prepare_dataset, save_prepared
-from .errors import BenchmarkError, SourceError
+from .errors import BenchmarkError, ProviderRequestError, RunIdentityError, SourceError
 from .preflight import run_preflight_from_env
+from .providers import JevAdapter, OpenRouterAdapter
+from .runner import RunStore
 
 
 def _print_header(title: str) -> None:
@@ -207,6 +222,298 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return 1
 
 
+# --------------------------------------------------------------------------- #
+# Shared helpers for the paid pilot/run commands.
+# --------------------------------------------------------------------------- #
+def _load_dataset_offline(args: argparse.Namespace) -> PreparedDataset:
+    """Rebuild the prepared dataset deterministically from the cached raw CSV.
+
+    No network request is made when a cached CSV (or explicit --source) exists,
+    so the frozen ordered-record and config hashes come straight from the
+    already-prepared official data.
+    """
+    source = getattr(args, "source", None)
+    if source:
+        return prepare_dataset(source=source)
+    raw_path = Path(args.data_dir) / "raw" / "maternal_health_risk.csv"
+    if raw_path.is_file():
+        return prepare_dataset(source=raw_path)
+    raise SourceError(
+        f"no cached CSV at {raw_path}; run 'jev-benchmark prepare' first or pass --source"
+    )
+
+
+def _dataset_rows(dataset: PreparedDataset) -> list[dict]:
+    return [
+        {"index": r.index, "features": r.features, "label": r.label}
+        for r in dataset.records
+    ]
+
+
+def _build_live_adapters(env: dict) -> dict:
+    """Build the three approved live adapters or raise if a credential is absent."""
+    typesafe_key = env.get("TYPESAFE_API_KEY")
+    openrouter_key = env.get("OPENROUTER_API_KEY")
+    return {
+        "jev-1.13.0": JevAdapter(typesafe_key),
+        "openai/gpt-4o-mini": OpenRouterAdapter("openai/gpt-4o-mini", openrouter_key),
+        "google/gemini-2.5-flash": OpenRouterAdapter(
+            "google/gemini-2.5-flash", openrouter_key
+        ),
+    }
+
+
+def _close_adapters(adapters: dict) -> None:
+    for adapter in adapters.values():
+        try:
+            adapter.close()
+        except Exception:
+            pass
+
+
+def _print_accounting(budget: dict) -> None:
+    print("accounting (conservative, redacted):")
+    print(f"  planning seed        : ${budget.get('planning_seed', 0.0):.6f}")
+    print(f"  OpenRouter billed    : ${budget.get('billed_openrouter', 0.0):.6f}")
+    print(f"  Jev rate-estimated   : ${budget.get('estimated_jev', 0.0):.6f}")
+    print(f"  unknown reserved     : ${budget.get('reserved_unknown', 0.0):.6f}")
+    print(f"  exposure             : ${budget.get('exposure', 0.0):.6f}")
+    print(f"  cap                  : ${budget.get('cap', CAP_USD):.2f}")
+    print(f"  remaining            : ${budget.get('remaining', 0.0):.6f}")
+
+
+def cmd_pilot(args: argparse.Namespace) -> int:
+    env = _load_env()
+    dataset = _load_dataset_offline(args)
+    rows = _dataset_rows(dataset)[: args.rows]
+    config_hash = dataset.provenance["config_hash"]
+    ordered_hash = dataset.provenance["ordered_record_sha256"]
+
+    ledger = BudgetLedger(cap=args.budget_cap)
+    try:
+        adapters = _build_live_adapters(env)
+    except ProviderRequestError as exc:
+        print(f"pilot blocked: {exc}", file=sys.stderr)
+        return 1
+
+    store = RunStore(args.run_dir)
+    try:
+        result = runner.run(
+            store=store,
+            adapters=adapters,
+            rows=rows,
+            model_ids=list(spec.MODEL_IDS),
+            config_hash=config_hash,
+            ordered_record_sha256=ordered_hash,
+            ledger=ledger,
+            mode="pilot",
+            max_retries=args.max_retries,
+        )
+    finally:
+        _close_adapters(adapters)
+
+    cases = result.completed_cases
+    ledger = result.ledger
+    projection = pilot_mod.project_full_run(
+        cases, ledger, list(spec.MODEL_IDS), safety_factor=args.safety_factor
+    )
+
+    _print_header("Live pilot")
+    print(f"config hash   : {config_hash}")
+    print(f"pilot rows    : {len(rows)}  (row-provider pairs attempted: {len(cases)})")
+    print(f"run dir       : {store.dir}")
+    print()
+    for case in cases:
+        last = case.attempts[-1] if case.attempts else None
+        print(
+            f"  row {case.row_index} {case.requested_model}: {case.outcome} "
+            f"-> {case.final_label} (gold {case.gold_label}, stages {case.stage_count}, "
+            f"actual {last.actual_model if last else None})"
+        )
+    print()
+    _print_accounting(ledger.as_dict())
+    print()
+    _print_header("Conservative full-run projection")
+    for prov in projection.providers:
+        print(
+            f"  {prov.model_id}: per-row ${prov.per_row_cost:.8f} "
+            f"-> projected ${prov.projected_full_cost:.6f}"
+        )
+    print(
+        f"projected full-run cost     : ${projection.projected_full_cost:.6f} "
+        f"(x{projection.safety_factor} safety, {projection.full_population_rows} rows)"
+    )
+    print(f"projected total exposure    : ${projection.projected_total_exposure:.6f}")
+    print(f"affordable within ${projection.cap:.2f}: {projection.affordable}")
+    print(f"decision: {projection.reason}")
+
+    out = {
+        "config_hash": config_hash,
+        "ordered_record_sha256": ordered_hash,
+        "run_dir": str(store.dir),
+        "projection": projection.as_dict(),
+        "budget": ledger.as_dict(),
+    }
+    proj_path = store.dir / "projection.json"
+    proj_path.write_text(json.dumps(out, indent=2) + "\n")
+    print(f"\nprojection written to {proj_path}")
+
+    # The pilot itself ran; a non-affordable projection means the full run is
+    # gated off, which the run command enforces. The pilot still exits 0 so its
+    # recorded evidence is preserved; a stopped-budget pilot exits non-zero.
+    if result.stopped:
+        print(f"pilot stopped early: {result.stop_reason}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _load_projection(pilot_dir: str) -> dict:
+    path = Path(pilot_dir) / "projection.json"
+    if not path.is_file():
+        raise BenchmarkError(f"no pilot projection at {path}; run 'jev-benchmark pilot' first")
+    return json.loads(path.read_text())
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    env = _load_env()
+    dataset = _load_dataset_offline(args)
+    all_rows = _dataset_rows(dataset)
+    rows = all_rows if args.rows is None else all_rows[: args.rows]
+    config_hash = dataset.provenance["config_hash"]
+    ordered_hash = dataset.provenance["ordered_record_sha256"]
+    is_full_population = len(rows) >= spec.EXPECTED_ROW_COUNT
+
+    # Gate: a full-population run must be preceded by an affordable pilot
+    # projection for the same frozen configuration.
+    if args.pilot_dir:
+        projection = _load_projection(args.pilot_dir)
+        if projection.get("config_hash") != config_hash:
+            print(
+                "run blocked: pilot projection was made for a different frozen "
+                "configuration; re-run the pilot.",
+                file=sys.stderr,
+            )
+            return 1
+        if not projection.get("projection", {}).get("affordable", False):
+            print(
+                "run blocked: pilot projects the full run would reach the shared "
+                f"budget cap. {projection['projection'].get('reason', '')}",
+                file=sys.stderr,
+            )
+            return 1
+    elif is_full_population and args.require_pilot:
+        print(
+            "run blocked: a full-population run requires an affordable pilot "
+            "projection (pass --pilot-dir); no bulk paid run starts before a pilot.",
+            file=sys.stderr,
+        )
+        return 1
+
+    ledger = BudgetLedger(cap=args.budget_cap)
+    store = RunStore(args.run_dir)
+    try:
+        adapters = _build_live_adapters(env)
+    except ProviderRequestError as exc:
+        print(f"run blocked: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = runner.run(
+            store=store,
+            adapters=adapters,
+            rows=rows,
+            model_ids=list(spec.MODEL_IDS),
+            config_hash=config_hash,
+            ordered_record_sha256=ordered_hash,
+            ledger=ledger,
+            mode="run",
+            max_retries=args.max_retries,
+            resume=args.resume,
+        )
+    except RunIdentityError as exc:
+        print(f"resume blocked: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        _close_adapters(adapters)
+
+    state = result.state
+    _print_header("Measured run")
+    print(f"run id        : {state.run_id}")
+    print(f"status        : {state.status}")
+    print(f"planned pairs : {state.planned_pairs}")
+    print(f"newly done    : {result.newly_completed}")
+    print(f"total run time: {state.total_run_seconds:.3f}s")
+    print()
+    _print_accounting(result.ledger.as_dict())
+    if result.stopped:
+        print(f"\nrun stopped before the cap: {result.stop_reason}", file=sys.stderr)
+        print("completed cases remain recorded and will not be re-billed on resume.")
+        return 1
+    if state.status != runner.COMPLETE:
+        print("\nrun is INCOMPLETE: not all planned pairs are covered.")
+        print("partial results must not be reported as a completed benchmark.")
+    else:
+        print("\nrun complete: every planned row-provider pair was evaluated.")
+    return 0
+
+
+def cmd_run_inspect(args: argparse.Namespace) -> int:
+    store = RunStore(args.run_dir)
+    if not store.exists():
+        print(f"error: no run.json under {store.dir}", file=sys.stderr)
+        return 2
+    summary = runinspect.inspect_run(store)
+
+    _print_header(f"Run inspection: {summary.run_id} ({summary.mode})")
+    print(f"status        : {summary.status}")
+    print(f"complete      : {summary.complete}")
+    print(f"config hash   : {summary.config_hash}")
+    print(f"planned pairs : {summary.planned_pairs}")
+    print(f"completed     : {summary.completed_pairs}")
+    print(f"total run time: {summary.total_run_seconds:.3f}s")
+    if summary.stop_reason:
+        print(f"stop reason   : {summary.stop_reason}")
+    print()
+    _print_accounting(summary.accounting)
+    print()
+    _print_header("Latency p50/p95 (seconds), with sample counts")
+    for prov in summary.providers:
+        api = prov.latency.api_attempt
+        wf = prov.latency.workflow
+        print(f"  {prov.model_id}:")
+        print(
+            f"    api-attempt : p50={_fmt(api['p50'])} p95={_fmt(api['p95'])} "
+            f"n={api['count']} (attempts={prov.api_attempts}, retried={prov.retried_attempts}, "
+            f"failed={prov.failed_attempts})"
+        )
+        print(
+            f"    workflow    : p50={_fmt(wf['p50'])} p95={_fmt(wf['p95'])} "
+            f"n={wf['count']} (cases={prov.attempted_cases})"
+        )
+        print(f"    outcomes    : {prov.outcome_counts}")
+    overall = summary.overall_latency
+    print("  overall:")
+    print(
+        f"    api-attempt : p50={_fmt(overall.api_attempt['p50'])} "
+        f"p95={_fmt(overall.api_attempt['p95'])} n={overall.api_attempt['count']}"
+    )
+    print(
+        f"    workflow    : p50={_fmt(overall.workflow['p50'])} "
+        f"p95={_fmt(overall.workflow['p95'])} n={overall.workflow['count']}"
+    )
+
+    out_path = store.dir / "inspection.json"
+    out_path.write_text(json.dumps(summary.as_dict(), indent=2) + "\n")
+    print(f"\ninspection written to {out_path}")
+    if not summary.complete:
+        print("note: this run is NOT a completed full benchmark.")
+    return 0
+
+
+def _fmt(value: float | None) -> str:
+    return f"{value:.4f}" if value is not None else "n/a"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jev-benchmark",
@@ -267,6 +574,95 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for the redacted preflight record (default: runs/preflight).",
     )
     p_preflight.set_defaults(func=cmd_preflight)
+
+    p_pilot = sub.add_parser(
+        "pilot",
+        help="Run a small real sample and project a conservative full-run cost (needs keys).",
+        description="Dispatch the two-stage workflow for a few rows to all three live "
+        "providers, record schema/usage/errors and timing, and project whether the full "
+        "1,014-row run fits the shared $20 budget guard. Makes small paid requests.",
+    )
+    p_pilot.add_argument("--data-dir", default="data", help="Prepared-data directory.")
+    p_pilot.add_argument(
+        "--source", default=None, help="CSV path to prepare from if no cached CSV."
+    )
+    p_pilot.add_argument(
+        "--run-dir", default="runs/pilot", help="Directory for pilot artifacts."
+    )
+    p_pilot.add_argument(
+        "--rows", type=int, default=2, help="Number of leading rows to pilot (default: 2)."
+    )
+    p_pilot.add_argument(
+        "--max-retries", type=int, default=2, help="Bounded retries per stage (default: 2)."
+    )
+    p_pilot.add_argument(
+        "--budget-cap", type=float, default=CAP_USD, help="Shared budget cap (default: 20)."
+    )
+    p_pilot.add_argument(
+        "--safety-factor",
+        type=float,
+        default=pilot_mod.DEFAULT_SAFETY_FACTOR,
+        help="Conservative multiplier on projected per-row cost (default: 2.0).",
+    )
+    p_pilot.set_defaults(func=cmd_pilot)
+
+    p_run = sub.add_parser(
+        "run",
+        help="Sequential, budgeted, resumable measured run across all three models (needs keys).",
+        description="Dispatch the frozen two-stage task sequentially for the prespecified "
+        "rows to every provider, with bounded retries, conservative stop-before-$20 budget "
+        "accounting, durable per-attempt records and same-config resume. A full-population "
+        "run requires an affordable pilot projection.",
+    )
+    p_run.add_argument("--data-dir", default="data", help="Prepared-data directory.")
+    p_run.add_argument(
+        "--source", default=None, help="CSV path to prepare from if no cached CSV."
+    )
+    p_run.add_argument(
+        "--run-dir", required=True, help="Directory for this run's durable artifacts."
+    )
+    p_run.add_argument(
+        "--rows",
+        type=int,
+        default=None,
+        help="Limit to the leading N rows (default: full 1,014-row population).",
+    )
+    p_run.add_argument(
+        "--pilot-dir",
+        default=None,
+        help="Pilot directory whose affordable projection gates this run.",
+    )
+    p_run.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing run, skipping completed pairs (same config required).",
+    )
+    p_run.add_argument(
+        "--max-retries", type=int, default=2, help="Bounded retries per stage (default: 2)."
+    )
+    p_run.add_argument(
+        "--budget-cap", type=float, default=CAP_USD, help="Shared budget cap (default: 20)."
+    )
+    p_run.add_argument(
+        "--no-require-pilot",
+        dest="require_pilot",
+        action="store_false",
+        help="Allow a full-population run without a pilot projection (not recommended).",
+    )
+    p_run.set_defaults(func=cmd_run, require_pilot=True)
+
+    p_run_inspect = sub.add_parser(
+        "run-inspect",
+        help="Offline summary of a saved run/pilot: outcomes, accounting, latency p50/p95.",
+        description="Read run.json and cases.jsonl from a run directory and report outcome "
+        "counts, conservative accounting (billed OpenRouter vs rate-estimated Jev vs unknown "
+        "reserved), latency p50/p95 at API-attempt and workflow scopes with sample counts, "
+        "and whether the run is complete. No paid requests.",
+    )
+    p_run_inspect.add_argument(
+        "--run-dir", required=True, help="Run directory to inspect."
+    )
+    p_run_inspect.set_defaults(func=cmd_run_inspect)
 
     return parser
 
