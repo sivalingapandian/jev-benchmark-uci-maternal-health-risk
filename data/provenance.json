@@ -1,0 +1,78 @@
+{
+  "source_dataset_url": "https://archive.ics.uci.edu/dataset/863/maternal+health+risk",
+  "source_data_url": "https://archive.ics.uci.edu/static/public/863/data.csv",
+  "license": "CC BY 4.0",
+  "citation": "Ahmed, Marzia. (2020). Maternal Health Risk [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5DP5D",
+  "retrieval_date": "2026-10-05",
+  "bytes_sha256": "a1f7025719f84715096e0d1f95ae2e56b57809b9b15449e1836c96a7d976ae9b",
+  "bytes_length": 30290,
+  "ordered_record_sha256": "ea285a63e5a4c16a5cfa8622db164edd932dc97046dff455b70ba784b43dcffe",
+  "row_count": 1014,
+  "metadata_reported_instances": 1013,
+  "metadata_discrepancy": "UCI dataset metadata reports 1013 instances, but the served CSV contains 1014 rows. All 1014 rows are kept; no row is silently removed.",
+  "schema": [
+    "Age",
+    "SystolicBP",
+    "DiastolicBP",
+    "BS",
+    "BodyTemp",
+    "HeartRate",
+    "RiskLevel"
+  ],
+  "feature_columns": [
+    "Age",
+    "SystolicBP",
+    "DiastolicBP",
+    "BS",
+    "BodyTemp",
+    "HeartRate"
+  ],
+  "label_column": "RiskLevel",
+  "class_distribution": {
+    "high risk": 272,
+    "mid risk": 336,
+    "low risk": 406
+  },
+  "config_hash": "fcc074a16ac2dedbf36877a363075feb78514d22aa0604df5027689f7e512732",
+  "spec": {
+    "feature_columns": [
+      "Age",
+      "SystolicBP",
+      "DiastolicBP",
+      "BS",
+      "BodyTemp",
+      "HeartRate"
+    ],
+    "label_column": "RiskLevel",
+    "risk_labels": [
+      "high risk",
+      "mid risk",
+      "low risk"
+    ],
+    "model_ids": [
+      "jev-1.13.0",
+      "openai/gpt-4o-mini",
+      "google/gemini-2.5-flash"
+    ],
+    "stage1": {
+      "name": "high risk rather than mid/low risk?",
+      "choices": [
+        "high",
+        "other"
+      ]
+    },
+    "stage2": {
+      "name": "mid risk rather than low risk?",
+      "choices": [
+        "mid",
+        "low"
+      ],
+      "gated_by": "stage1 == other"
+    },
+    "label_mapping": {
+      "high": "high risk",
+      "other+mid": "mid risk",
+      "other+low": "low risk"
+    }
+  }
+}

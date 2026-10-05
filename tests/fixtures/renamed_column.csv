@@ -1,0 +1,3 @@
+Age,SystolicBP,DiastolicBP,BloodSugar,BodyTemp,HeartRate,RiskLevel
+25,130,80,15,98,86,high risk
+30,100,70,8,98,80,mid risk

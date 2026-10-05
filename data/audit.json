@@ -1,0 +1,82 @@
+{
+  "total_rows": 1014,
+  "distinct_complete_rows": 452,
+  "distinct_feature_vectors": 416,
+  "repeated_feature_vector_groups": 286,
+  "rows_in_repeated_feature_groups": 884,
+  "conflicting_label_groups": 35,
+  "conflicting_examples": [
+    {
+      "features": {
+        "Age": 35,
+        "SystolicBP": 120,
+        "DiastolicBP": 60,
+        "BS": 6.1,
+        "BodyTemp": 98.0,
+        "HeartRate": 76
+      },
+      "labels": [
+        "low risk",
+        "mid risk"
+      ]
+    },
+    {
+      "features": {
+        "Age": 42,
+        "SystolicBP": 130,
+        "DiastolicBP": 80,
+        "BS": 18.0,
+        "BodyTemp": 98.0,
+        "HeartRate": 70
+      },
+      "labels": [
+        "high risk",
+        "mid risk"
+      ]
+    },
+    {
+      "features": {
+        "Age": 19,
+        "SystolicBP": 120,
+        "DiastolicBP": 80,
+        "BS": 7.0,
+        "BodyTemp": 98.0,
+        "HeartRate": 70
+      },
+      "labels": [
+        "low risk",
+        "mid risk"
+      ]
+    },
+    {
+      "features": {
+        "Age": 48,
+        "SystolicBP": 120,
+        "DiastolicBP": 80,
+        "BS": 11.0,
+        "BodyTemp": 98.0,
+        "HeartRate": 88
+      },
+      "labels": [
+        "high risk",
+        "low risk",
+        "mid risk"
+      ]
+    },
+    {
+      "features": {
+        "Age": 31,
+        "SystolicBP": 120,
+        "DiastolicBP": 60,
+        "BS": 6.1,
+        "BodyTemp": 98.0,
+        "HeartRate": 76
+      },
+      "labels": [
+        "low risk",
+        "mid risk"
+      ]
+    }
+  ],
+  "note": "Repeated feature vectors and complete-row duplicates remain in the primary 1,014-row population. Deduplication/reweighting is reserved for a separate sensitivity analysis and must not replace the primary denominator."
+}

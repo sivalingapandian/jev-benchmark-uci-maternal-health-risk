@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jev-benchmark"
+version = "0.1.0"
+description = "Retrospective benchmark of Jev and two OpenRouter LLMs on the public UCI Maternal Health Risk labels."
+readme = "README.md"
+requires-python = "==3.12.*"
+license = { text = "MIT" }
+authors = [{ name = "jev-benchmark maintainers" }]
+
+# Pins mirror the readiness-verified project .venv so a fresh clone reproduces
+# the same behaviour. Refresh deliberately, not casually.
+dependencies = [
+    "httpx==0.28.1",
+    "pandas==3.0.6",
+    "numpy==2.5.3",
+    "python-dotenv==1.2.4",
+    "typesafe-sdk==0.7.2",
+    "openai==3.24.0",
+    "ucimlrepo==0.0.7",
+    "scikit-learn==1.9.1",
+    "scipy==1.18.1",
+    "matplotlib==3.11.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.10",
+    "jupyter==1.1.1",
+    "nbconvert==7.17.1",
+    "nbclient==0.11.0",
+]
+
+[project.scripts]
+jev-benchmark = "jev_benchmark.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
