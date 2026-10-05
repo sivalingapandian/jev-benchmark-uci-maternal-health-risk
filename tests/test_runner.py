@@ -254,6 +254,38 @@ def test_resume_refuses_on_changed_config(tmp_path):
         )
 
 
+def test_resume_refuses_when_task_wording_changes_identity(tmp_path, monkeypatch):
+    # A reworded stage instruction changes the frozen experiment identity
+    # (config_hash), which must block an otherwise-matching resume.
+    run_dir = tmp_path / "run_identity"
+    original_hash = spec.config_hash()
+    runner.run(
+        store=runner.RunStore(run_dir),
+        adapters=_three_providers_all_high(),
+        rows=_rows(1),
+        model_ids=MODEL_IDS,
+        config_hash=original_hash,
+        ordered_record_sha256="hash",
+        ledger=BudgetLedger(),
+    )
+    monkeypatch.setitem(
+        spec.STAGE1, "instructions", spec.STAGE1_INSTRUCTIONS + " (reworded)"
+    )
+    reworded_hash = spec.config_hash()
+    assert reworded_hash != original_hash
+    with pytest.raises(RunIdentityError):
+        runner.run(
+            store=runner.RunStore(run_dir),
+            adapters=_three_providers_all_high(),
+            rows=_rows(1),
+            model_ids=MODEL_IDS,
+            config_hash=reworded_hash,
+            ordered_record_sha256="hash",
+            ledger=BudgetLedger(),
+            resume=True,
+        )
+
+
 def test_resume_refuses_on_changed_dataset_hash(tmp_path):
     run_dir = tmp_path / "run5"
     store = runner.RunStore(run_dir)

@@ -91,6 +91,32 @@ SOURCE_CITATION = (
 METADATA_REPORTED_INSTANCES = 1013
 EXPECTED_ROW_COUNT = 1014
 
+# Output-schema semantics every provider request shares: a bounded choice, a
+# confidence scalar, and a per-choice probability map. These are folded into the
+# experiment identity (see ``config_hash``) so a schema change cannot silently
+# share a run or resume with a run built on a different schema.
+OUTPUT_SCHEMA_FIELDS: dict[str, str] = {
+    "choice": "exactly one of the stage's allowed choices",
+    "confidence": "a number in [0, 1]",
+    "probabilities": "a mapping from each allowed choice to a number in [0, 1]",
+}
+
+# Whether the measurement JSON embedded in a provider prompt is key-sorted. It
+# is part of the effective serialization, so a change here changes the identity.
+FEATURE_SERIALIZATION_SORT_KEYS = True
+
+# A fixed non-patient sample used only to fingerprint the effective prompt
+# wording and feature serialization in the experiment identity. It is never sent
+# to a provider during a measured run.
+_IDENTITY_SAMPLE_STATE: dict[str, float] = {
+    "Age": 30,
+    "SystolicBP": 120,
+    "DiastolicBP": 80,
+    "BS": 7.5,
+    "BodyTemp": 98.0,
+    "HeartRate": 76,
+}
+
 
 @dataclass(frozen=True)
 class TaskSpec:
@@ -104,21 +130,41 @@ class TaskSpec:
     stage2: dict
 
     def as_dict(self) -> dict:
+        # The identity deliberately includes the *effective* two-stage
+        # instructions, the rendered prompts (which embed feature serialization
+        # and the requested output schema), and the output-schema field
+        # semantics. A change to any of these must alter ``config_hash`` so a
+        # reworded task or an altered schema cannot silently share a run/resume.
         return {
             "feature_columns": list(self.feature_columns),
             "label_column": self.label_column,
             "risk_labels": list(self.risk_labels),
             "model_ids": list(self.model_ids),
-            "stage1": {"name": self.stage1["name"], "choices": list(self.stage1["choices"])},
+            "stage1": {
+                "name": self.stage1["name"],
+                "choices": list(self.stage1["choices"]),
+                "instructions": self.stage1["instructions"],
+            },
             "stage2": {
                 "name": self.stage2["name"],
                 "choices": list(self.stage2["choices"]),
                 "gated_by": self.stage2["gated_by"],
+                "instructions": self.stage2["instructions"],
             },
             "label_mapping": {
                 "high": "high risk",
                 "other+mid": "mid risk",
                 "other+low": "low risk",
+            },
+            "output_schema": dict(OUTPUT_SCHEMA_FIELDS),
+            "feature_serialization": {
+                "order": list(self.feature_columns),
+                "sort_keys": FEATURE_SERIALIZATION_SORT_KEYS,
+                "sample": serialize_features(_IDENTITY_SAMPLE_STATE),
+            },
+            "effective_prompts": {
+                "stage1": build_user_prompt(self.stage1, _IDENTITY_SAMPLE_STATE),
+                "stage2": build_user_prompt(self.stage2, _IDENTITY_SAMPLE_STATE),
             },
         }
 
@@ -160,7 +206,9 @@ def build_user_prompt(stage: dict, state: dict) -> str:
     ``RiskLevel`` label is never part of ``state`` and so can never appear.
     """
     choices = stage["choices"]
-    measurements = json.dumps(serialize_features(state), sort_keys=True)
+    measurements = json.dumps(
+        serialize_features(state), sort_keys=FEATURE_SERIALIZATION_SORT_KEYS
+    )
     return (
         f"{stage['instructions']}\n\n"
         f"Record measurements (JSON): {measurements}\n\n"

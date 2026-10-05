@@ -47,6 +47,27 @@ def test_null_value_fails(fixtures_dir):
         prepare_dataset(source=fixtures_dir / "null_value.csv")
 
 
+def test_nonnumeric_feature_value_fails(fixtures_dir):
+    # A non-numeric measurement (e.g. Age="abc") must fail preparation before
+    # any provider dispatch, not slip through as an opaque object value.
+    with pytest.raises(SchemaError):
+        prepare_dataset(source=fixtures_dir / "nonnumeric_value.csv")
+
+
+def test_nonfinite_feature_value_fails(fixtures_dir):
+    # inf/-inf are not caught by the null check, so a dedicated finite check must
+    # reject them before dispatch.
+    with pytest.raises(SchemaError):
+        prepare_dataset(source=fixtures_dir / "nonfinite_value.csv")
+
+
+def test_short_local_csv_is_not_official_population(fixtures_dir):
+    ds = prepare_dataset(source=fixtures_dir / "valid_small.csv")
+    assert ds.provenance["is_official_population"] is False
+    assert ds.provenance["source_origin"] == "local_path"
+    assert ds.provenance["row_count"] != spec.EXPECTED_ROW_COUNT
+
+
 def test_missing_source_file_fails():
     with pytest.raises(SourceError):
         prepare_dataset(source="tests/fixtures/does_not_exist.csv")
@@ -75,3 +96,7 @@ def test_official_dataset_counts_and_hashes(official_csv):
     assert ds.audit["distinct_complete_rows"] == 452
     assert ds.audit["conflicting_label_groups"] == 35
     assert ds.audit["total_rows"] == 1014
+
+    # The official 1,014-row population is recognised as such.
+    assert prov["is_official_population"] is True
+    assert prov["source_origin"] == "local_path"

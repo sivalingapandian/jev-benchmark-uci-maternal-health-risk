@@ -69,3 +69,37 @@ def test_compose_label_rejects_unknown_stage1():
 def test_config_hash_is_stable():
     assert spec.config_hash() == spec.config_hash()
     assert len(spec.config_hash()) == 64
+
+
+def test_identity_includes_effective_instructions_serialization_and_schema():
+    payload = spec.task_spec().as_dict()
+    # Effective two-stage wording is part of the inspectable frozen definition.
+    assert spec.STAGE1_INSTRUCTIONS in payload["stage1"]["instructions"]
+    assert spec.STAGE2_INSTRUCTIONS in payload["stage2"]["instructions"]
+    # Feature serialization and output-schema semantics are captured too.
+    assert payload["feature_serialization"]["order"] == list(spec.FEATURE_COLUMNS)
+    assert set(payload["output_schema"]) >= {"choice", "confidence", "probabilities"}
+    assert "stage1" in payload["effective_prompts"]
+
+
+def test_config_hash_changes_when_instruction_wording_changes(monkeypatch):
+    before = spec.config_hash()
+    monkeypatch.setitem(spec.STAGE1, "instructions", spec.STAGE1_INSTRUCTIONS + " (reworded)")
+    after = spec.config_hash()
+    assert before != after
+
+
+def test_config_hash_changes_when_output_schema_changes(monkeypatch):
+    before = spec.config_hash()
+    changed = dict(spec.OUTPUT_SCHEMA_FIELDS)
+    changed["choice"] = "a different schema description"
+    monkeypatch.setattr(spec, "OUTPUT_SCHEMA_FIELDS", changed)
+    after = spec.config_hash()
+    assert before != after
+
+
+def test_config_hash_changes_when_feature_serialization_changes(monkeypatch):
+    before = spec.config_hash()
+    monkeypatch.setattr(spec, "FEATURE_SERIALIZATION_SORT_KEYS", False)
+    after = spec.config_hash()
+    assert before != after

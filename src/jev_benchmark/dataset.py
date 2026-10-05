@@ -108,6 +108,31 @@ def _validate_schema(frame: pd.DataFrame) -> None:
         raise SchemaError(f"source contains null values in required columns: {offending}")
 
 
+def _validate_feature_values(frame: pd.DataFrame) -> None:
+    """Reject any feature column that is not finite and numeric.
+
+    The null check in :func:`_validate_schema` does not catch non-numeric text
+    (e.g. ``"abc"``) or non-finite floats (``inf``/``-inf``), yet such values must
+    never reach a provider request. This fails preparation before dispatch.
+    """
+    for col in spec.FEATURE_COLUMNS:
+        coerced = pd.to_numeric(frame[col], errors="coerce")
+        nonnumeric_mask = coerced.isna() & frame[col].notna()
+        if nonnumeric_mask.any():
+            bad = sorted({str(v) for v in frame.loc[nonnumeric_mask, col].tolist()})[:5]
+            raise SchemaError(
+                f"feature column {col!r} contains non-numeric value(s) {bad}; "
+                "all six measurements must be finite numbers"
+            )
+        values = coerced.to_numpy(dtype="float64")
+        if not np.isfinite(values).all():
+            bad = sorted({str(v) for v in coerced[~np.isfinite(values)].tolist()})[:5]
+            raise SchemaError(
+                f"feature column {col!r} contains non-finite value(s) {bad}; "
+                "all six measurements must be finite numbers"
+            )
+
+
 def _validate_labels(frame: pd.DataFrame) -> None:
     observed = set(frame[spec.LABEL_COLUMN].unique())
     invalid = sorted(observed - set(spec.RISK_LABELS))
@@ -142,7 +167,12 @@ def _class_distribution(records: list[Record]) -> dict:
     return counts
 
 
-def _build_provenance(raw: bytes, records: list[Record], retrieval_date: str | None) -> dict:
+def _build_provenance(
+    raw: bytes,
+    records: list[Record],
+    retrieval_date: str | None,
+    source_origin: str,
+) -> dict:
     if retrieval_date is None:
         retrieval_date = _dt.datetime.now(_dt.UTC).date().isoformat()
     row_count = len(records)
@@ -151,11 +181,19 @@ def _build_provenance(raw: bytes, records: list[Record], retrieval_date: str | N
         f"but the served CSV contains {row_count} rows. All {row_count} rows are kept; "
         "no row is silently removed."
     )
+    # The official population is exactly the published 1,014-row CSV. A short or
+    # otherwise differently-sized CSV (e.g. a fixture or local sample) is NOT the
+    # official population and must not authorize a full paid evaluation nor be
+    # presented as the official dataset.
+    is_official_population = row_count == spec.EXPECTED_ROW_COUNT
     return {
         "source_dataset_url": spec.SOURCE_DATASET_URL,
         "source_data_url": spec.SOURCE_DATA_URL,
         "license": spec.SOURCE_LICENSE,
         "citation": spec.SOURCE_CITATION,
+        "source_origin": source_origin,
+        "is_official_population": is_official_population,
+        "expected_row_count": spec.EXPECTED_ROW_COUNT,
         "retrieval_date": retrieval_date,
         "bytes_sha256": hashlib.sha256(raw).hexdigest(),
         "bytes_length": len(raw),
@@ -234,9 +272,11 @@ def prepare_dataset(
     raw = _read_source_bytes(source)
     frame = _parse(raw)
     _validate_schema(frame)
+    _validate_feature_values(frame)
     _validate_labels(frame)
     records = _build_records(frame)
-    provenance = _build_provenance(raw, records, retrieval_date)
+    source_origin = "official_url" if source is None else "local_path"
+    provenance = _build_provenance(raw, records, retrieval_date, source_origin)
     audit = _audit(frame)
     return PreparedDataset(records=records, provenance=provenance, audit=audit, raw_bytes=raw)
 

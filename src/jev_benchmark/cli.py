@@ -56,7 +56,16 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     prov = dataset.provenance
     audit = dataset.audit
 
-    _print_header("Prepared official UCI Maternal Health Risk dataset")
+    if prov["is_official_population"]:
+        _print_header("Prepared official UCI Maternal Health Risk dataset")
+    else:
+        _print_header("Prepared NON-OFFICIAL local CSV (not the official UCI population)")
+        print(
+            f"NOTE: this CSV has {prov['row_count']} rows, not the official "
+            f"{prov['expected_row_count']}-row UCI population. It cannot authorize a "
+            "full paid evaluation or be reported as the official benchmark population."
+        )
+    print(f"source origin     : {prov['source_origin']}")
     print(f"source            : {prov['source_data_url']}")
     print(f"license           : {prov['license']}")
     print(f"retrieval date    : {prov['retrieval_date']}")
@@ -350,6 +359,7 @@ def cmd_pilot(args: argparse.Namespace) -> int:
     out = {
         "config_hash": config_hash,
         "ordered_record_sha256": ordered_hash,
+        "is_official_population": bool(dataset.provenance.get("is_official_population")),
         "run_dir": str(store.dir),
         "projection": projection.as_dict(),
         "budget": ledger.as_dict(),
@@ -381,7 +391,24 @@ def cmd_run(args: argparse.Namespace) -> int:
     rows = all_rows if args.rows is None else all_rows[: args.rows]
     config_hash = dataset.provenance["config_hash"]
     ordered_hash = dataset.provenance["ordered_record_sha256"]
+    is_official_population = bool(dataset.provenance.get("is_official_population"))
     is_full_population = len(rows) >= spec.EXPECTED_ROW_COUNT
+    # Default (``--rows`` unset) means the complete benchmark over every source
+    # row; that is a full paid evaluation and is only valid for the official
+    # 1,014-row population. A short arbitrary CSV may only run an explicit,
+    # smaller ``--rows N`` test, never the full benchmark.
+    wants_full_population = args.rows is None
+
+    if wants_full_population and not is_official_population:
+        print(
+            "run blocked: a full paid evaluation requires the official "
+            f"{spec.EXPECTED_ROW_COUNT}-row UCI population, but the prepared data has "
+            f"{len(rows)} rows and is not the official population. "
+            "Prepare the official dataset, or pass an explicit --rows N for a small "
+            "non-official test run.",
+            file=sys.stderr,
+        )
+        return 1
 
     # Gate: a full-population run must be preceded by an affordable pilot
     # projection for the same frozen configuration.
@@ -391,6 +418,13 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(
                 "run blocked: pilot projection was made for a different frozen "
                 "configuration; re-run the pilot.",
+                file=sys.stderr,
+            )
+            return 1
+        if projection.get("ordered_record_sha256") != ordered_hash:
+            print(
+                "run blocked: pilot projection was made for a different dataset "
+                "(ordered-record hash mismatch); re-run the pilot on this data.",
                 file=sys.stderr,
             )
             return 1
