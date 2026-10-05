@@ -5,13 +5,16 @@ retry/interrupt/resume behaviour is deterministic. These complement the live
 pilot CLI, which exercises the real three-provider dispatch.
 """
 
+import json
+
 import pytest
 
 from jev_benchmark import runner, spec, workflow
-from jev_benchmark.budget import BudgetLedger, Pricing
+from jev_benchmark.budget import BudgetLedger, Pricing, open_shared_budget
 from jev_benchmark.errors import (
     InvalidDecisionError,
     ProviderRequestError,
+    RunDirectoryError,
     RunIdentityError,
 )
 from jev_benchmark.providers.base import ProviderAdapter, StageDecision, Usage
@@ -364,3 +367,233 @@ def test_run_marks_incomplete_when_stopped_before_all_pairs(tmp_path):
     )
     assert result.state.status in (runner.STOPPED_BUDGET, runner.INCOMPLETE)
     assert len({c.key for c in store.load_cases()}) < result.state.planned_pairs
+
+
+# --------------------------------------------------------------------------- #
+# Stage journal and occupied-directory guard
+# --------------------------------------------------------------------------- #
+def test_stage_journal_records_each_completed_stage(tmp_path):
+    store = runner.RunStore(tmp_path / "run8")
+    runner.run(
+        store=store,
+        adapters=_three_providers_all_high(),
+        rows=_rows(1),
+        model_ids=MODEL_IDS,
+        config_hash="cfg",
+        ordered_record_sha256="hash",
+        ledger=BudgetLedger(),
+    )
+    entries = store.load_stage_entries()
+    # One all-high case per provider, so one stage-1 entry each.
+    assert len(entries) == 3
+    assert {e["requested_model"] for e in entries} == set(MODEL_IDS)
+    assert all(e["stage"] == "stage1" for e in entries)
+    assert all(e["decision"]["choice"] == "high" for e in entries)
+    assert all(len(e["attempts"]) == 1 for e in entries)
+
+
+def test_fresh_run_refuses_occupied_directory(tmp_path):
+    run_dir = tmp_path / "run9"
+    store = runner.RunStore(run_dir)
+    runner.run(
+        store=store,
+        adapters=_three_providers_all_high(),
+        rows=_rows(1),
+        model_ids=MODEL_IDS,
+        config_hash="cfg",
+        ordered_record_sha256="hash",
+        ledger=BudgetLedger(),
+    )
+    cases_before = store.load_cases()
+    # A non-resume run on the same directory must refuse, not append duplicates.
+    with pytest.raises(RunDirectoryError):
+        runner.run(
+            store=runner.RunStore(run_dir),
+            adapters=_three_providers_all_high(),
+            rows=_rows(1),
+            model_ids=MODEL_IDS,
+            config_hash="cfg",
+            ordered_record_sha256="hash",
+            ledger=BudgetLedger(),
+        )
+    assert runner.RunStore(run_dir).load_cases() == cases_before
+
+
+class CrashAfterStage1(ProviderAdapter):
+    """Answers stage 1 then crashes hard (non-provider fault) on stage 2."""
+
+    def __init__(self, model_id, cost):
+        self.model_id = model_id
+        self._cost = cost
+        self.calls = []
+
+    def decide(self, stage, state):
+        self.calls.append(stage["id"])
+        if stage["id"] == "stage2":
+            raise RuntimeError("simulated process crash mid-workflow")
+        return _decision("stage1", "other", self.model_id, cost=self._cost)
+
+    def close(self):
+        pass
+
+
+def _openrouter_providers_stage2(model_results):
+    """Build a three-provider dict; ``model_results`` maps model -> stage2 outcome."""
+    adapters = {}
+    for model_id in MODEL_IDS:
+        if model_id == "jev-1.13.0":
+            adapters[model_id] = _high_only("jev-1.13.0", cost=None)
+        else:
+            result = model_results.get(model_id, "high")
+            if result == "high":
+                adapters[model_id] = _high_only(model_id, cost=0.00002)
+            else:
+                adapters[model_id] = result
+    return adapters
+
+
+def test_resume_recovers_interrupted_stage1_without_redispatch(tmp_path):
+    run_dir = tmp_path / "run10"
+    store = runner.RunStore(run_dir)
+    crashing = CrashAfterStage1("openai/gpt-4o-mini", cost=0.00002)
+    adapters = _openrouter_providers_stage2({"openai/gpt-4o-mini": crashing})
+
+    # Session 1 crashes mid-workflow after stage 1 succeeded and was journaled.
+    with pytest.raises(RuntimeError):
+        runner.run(
+            store=store,
+            adapters=adapters,
+            rows=_rows(1),
+            model_ids=MODEL_IDS,
+            config_hash="cfg",
+            ordered_record_sha256="hash",
+            ledger=BudgetLedger(),
+        )
+    # Row-major order means jev (first provider) completed before the crash;
+    # the gpt case was interrupted, but its stage-1 success is durably journaled.
+    completed = store.load_cases()
+    assert [c.requested_model for c in completed] == ["jev-1.13.0"]
+    journal = store.load_stage_entries()
+    partial = [e for e in journal if e["requested_model"] == "openai/gpt-4o-mini"]
+    assert len(partial) == 1 and partial[0]["stage"] == "stage1"
+
+    # Session 2 resumes with a healthy adapter for the previously-crashing model.
+    healthy = ScriptedInner(
+        "openai/gpt-4o-mini",
+        {"stage2": [_decision("stage2", "mid", "openai/gpt-4o-mini", cost=0.00003)]},
+    )
+    adapters2 = _openrouter_providers_stage2({"openai/gpt-4o-mini": healthy})
+    result = runner.run(
+        store=runner.RunStore(run_dir),
+        adapters=adapters2,
+        rows=_rows(1),
+        model_ids=MODEL_IDS,
+        config_hash="cfg",
+        ordered_record_sha256="hash",
+        ledger=BudgetLedger(),
+        resume=True,
+    )
+    # Stage 1 was NOT re-dispatched for the resumed case; only stage 2 ran.
+    assert healthy.calls == ["stage2"]
+    assert result.state.status == runner.COMPLETE
+
+    cases = runner.RunStore(run_dir).load_cases()
+    resumed = next(c for c in cases if c.requested_model == "openai/gpt-4o-mini")
+    assert resumed.outcome == workflow.PREDICTED
+    assert resumed.final_label == "mid risk"
+    assert resumed.stage_count == 2
+    # The case carries both the journaled stage-1 attempt and the new stage-2
+    # attempt, in order.
+    assert [a.stage for a in resumed.attempts] == ["stage1", "stage2"]
+
+
+def test_resume_does_not_double_bill_interrupted_stage(tmp_path):
+    run_dir = tmp_path / "run11"
+    store = runner.RunStore(run_dir)
+    crashing = CrashAfterStage1("openai/gpt-4o-mini", cost=0.00002)
+    adapters = _openrouter_providers_stage2({"openai/gpt-4o-mini": crashing})
+    with pytest.raises(RuntimeError):
+        runner.run(
+            store=store,
+            adapters=adapters,
+            rows=_rows(1),
+            model_ids=MODEL_IDS,
+            config_hash="cfg",
+            ordered_record_sha256="hash",
+            ledger=BudgetLedger(planning_seed=0.0),
+        )
+
+    healthy = ScriptedInner(
+        "openai/gpt-4o-mini",
+        {"stage2": [_decision("stage2", "mid", "openai/gpt-4o-mini", cost=0.00003)]},
+    )
+    adapters2 = _openrouter_providers_stage2({"openai/gpt-4o-mini": healthy})
+    result = runner.run(
+        store=runner.RunStore(run_dir),
+        adapters=adapters2,
+        rows=_rows(1),
+        model_ids=MODEL_IDS,
+        config_hash="cfg",
+        ordered_record_sha256="hash",
+        ledger=BudgetLedger(planning_seed=0.0),
+        resume=True,
+    )
+    # The journaled stage-1 billed cost is replayed exactly once, then the new
+    # session's costs are added: gpt stage1 $0.00002 (journaled, session 1) +
+    # gpt stage2 $0.00003 + gemini $0.00002 (both session 2). Jev is estimated,
+    # not billed, and was completed in session 1 so it is skipped on resume.
+    billed = result.state.budget["billed_openrouter"]
+    assert billed == pytest.approx(0.00002 + 0.00003 + 0.00002)
+
+
+def test_resume_with_bound_shared_ledger_keeps_cumulative_exposure(tmp_path):
+    # When the ledger is bound to a durable shared store, resume must trust that
+    # store (already flushed during the interrupted session) and never replay
+    # settlements a second time.
+    run_dir = tmp_path / "run12"
+    budget_path = tmp_path / "shared-budget.json"
+    ledger = open_shared_budget(budget_path, runs_dir=tmp_path / "empty-runs")
+    runner.run(
+        store=runner.RunStore(run_dir),
+        adapters=_three_providers_all_high(),
+        rows=_rows(1),
+        model_ids=MODEL_IDS,
+        config_hash="cfg",
+        ordered_record_sha256="hash",
+        ledger=ledger,
+    )
+    exposure_after_first = open_shared_budget(budget_path).exposure
+
+    ledger2 = open_shared_budget(budget_path)
+    result = runner.run(
+        store=runner.RunStore(run_dir),
+        adapters=_three_providers_all_high(),
+        rows=_rows(1),  # all pairs already completed: resume is a no-op
+        model_ids=MODEL_IDS,
+        config_hash="cfg",
+        ordered_record_sha256="hash",
+        ledger=ledger2,
+        resume=True,
+    )
+    assert result.newly_completed == 0
+    assert result.ledger.exposure == pytest.approx(exposure_after_first)
+
+
+def test_run_json_budget_snapshot_includes_pending_key_via_shared_store(tmp_path):
+    # Sanity: the shared store file written during a run is valid JSON with the
+    # expected buckets.
+    budget_path = tmp_path / "shared-budget.json"
+    ledger = open_shared_budget(budget_path, runs_dir=tmp_path / "empty-runs")
+    runner.run(
+        store=runner.RunStore(tmp_path / "run13"),
+        adapters=_three_providers_all_high(),
+        rows=_rows(1),
+        model_ids=MODEL_IDS,
+        config_hash="cfg",
+        ordered_record_sha256="hash",
+        ledger=ledger,
+    )
+    saved = json.loads(budget_path.read_text())
+    assert saved["billed_openrouter"] == pytest.approx(0.00002 + 0.00003)
+    assert saved["estimated_jev"] > 0.0
+    assert saved["pending"] == []

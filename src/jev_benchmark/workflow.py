@@ -127,30 +127,45 @@ class RowOutcome:
         }
 
 
-def evaluate_state(adapter: ProviderAdapter, state: dict) -> RowOutcome:
+def evaluate_state(
+    adapter: ProviderAdapter,
+    state: dict,
+    prior_stages: dict | None = None,
+) -> RowOutcome:
     """Run the two-stage workflow for one provider against the six measurements.
 
     ``state`` carries only the permitted measurements; no label is ever passed.
     Stage 2 runs only when this provider's own stage-1 answer is ``other``.
+
+    ``prior_stages`` optionally maps a stage id (``"stage1"``/``"stage2"``) to a
+    previously-completed :class:`StageDecision` recovered from a run's stage
+    journal. A stage present there is *not* re-dispatched (so a crash-resumed
+    workflow never re-bills a stage that already succeeded); only missing stages
+    are sent to the provider.
     """
+    prior_stages = prior_stages or {}
     stages: list[StageRecord] = []
 
     # Stage 1.
-    try:
-        d1 = adapter.decide(spec.STAGE1, state)
-    except ProviderError as exc:
-        rec = StageRecord.from_error(spec.STAGE1, adapter.model_id, exc)
-        stages.append(rec)
-        return RowOutcome(
-            requested_model=adapter.model_id,
-            actual_model=rec.actual_model,
-            outcome=rec.status,
-            final_label=None,
-            stages=stages,
-            detail=rec.detail,
-        )
-
-    stages.append(StageRecord.from_decision(d1))
+    prior_d1 = prior_stages.get(spec.STAGE1["id"])
+    if prior_d1 is not None:
+        d1 = prior_d1
+        stages.append(StageRecord.from_decision(d1))
+    else:
+        try:
+            d1 = adapter.decide(spec.STAGE1, state)
+        except ProviderError as exc:
+            rec = StageRecord.from_error(spec.STAGE1, adapter.model_id, exc)
+            stages.append(rec)
+            return RowOutcome(
+                requested_model=adapter.model_id,
+                actual_model=rec.actual_model,
+                outcome=rec.status,
+                final_label=None,
+                stages=stages,
+                detail=rec.detail,
+            )
+        stages.append(StageRecord.from_decision(d1))
 
     if d1.choice == "high":
         return RowOutcome(
@@ -162,6 +177,16 @@ def evaluate_state(adapter: ProviderAdapter, state: dict) -> RowOutcome:
         )
 
     # Only this provider's own ``other`` reaches here and earns stage 2.
+    prior_d2 = prior_stages.get(spec.STAGE2["id"])
+    if prior_d2 is not None:
+        stages.append(StageRecord.from_decision(prior_d2))
+        return RowOutcome(
+            requested_model=adapter.model_id,
+            actual_model=prior_d2.actual_model,
+            outcome=PREDICTED,
+            final_label=spec.compose_label("other", prior_d2.choice),
+            stages=stages,
+        )
     try:
         d2 = adapter.decide(spec.STAGE2, state)
     except ProviderError as exc:

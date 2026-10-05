@@ -91,11 +91,12 @@ def test_branch_follows_provider_not_gold_or_peer():
 
 
 def test_evaluate_state_signature_has_no_label_input():
-    # The gold label cannot enter the workflow: evaluate_state takes only state.
+    # The gold label cannot enter the workflow: no parameter may carry it.
     import inspect
 
     params = list(inspect.signature(workflow.evaluate_state).parameters)
-    assert params == ["adapter", "state"]
+    assert params[:2] == ["adapter", "state"]
+    assert not any("label" in p or "gold" in p for p in params)
 
 
 def test_stage1_invalid_blocks_stage2_and_has_no_label():

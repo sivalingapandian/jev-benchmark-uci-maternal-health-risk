@@ -12,15 +12,21 @@ to each provider, one paid request at a time. It wraps every provider in a
 
 Completed row-provider cases are appended to ``cases.jsonl`` and the run header
 (identity, status, cumulative run time, budget snapshot) to ``run.json`` after
-every case, so an interruption loses at most the in-flight case. Resume rebuilds
-the ledger by replaying recorded settlements, skips already-completed cases, and
-refuses to continue if the dataset or task specification changed.
+every case. Each *completed stage* is additionally journaled to ``stages.jsonl``
+right after it succeeds and before the next stage dispatches, so an interruption
+mid-workflow never silently re-bills a stage that already returned. Resume
+rebuilds partial cases from the stage journal (skipping their stages), rebuilds
+the ledger by replaying recorded settlements unless the ledger is already bound
+to a durable shared store, skips completed cases, and refuses to continue if the
+dataset or task specification changed. A fresh (non-resume) run refuses an
+already-occupied directory instead of duplicating cases on top of it.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +39,7 @@ from .errors import (
     ProviderError,
     ProviderRequestError,
     RefusalError,
+    RunDirectoryError,
     RunIdentityError,
 )
 from .providers.base import ProviderAdapter, StageDecision, Usage
@@ -204,6 +211,7 @@ class MeasuredAdapter(ProviderAdapter):
         ledger: BudgetLedger,
         *,
         max_retries: int = 2,
+        stage_sink: Callable[[StageDecision, list[AttemptRecord]], None] | None = None,
     ) -> None:
         self.inner = inner
         self.model_id = inner.model_id
@@ -211,6 +219,10 @@ class MeasuredAdapter(ProviderAdapter):
         self.ledger = ledger
         self.max_retries = max_retries
         self.attempts: list[AttemptRecord] = []
+        # Invoked with (decision, attempts-for-this-stage) right after a stage
+        # succeeds, so the runner can durably journal a completed stage before
+        # the next one dispatches.
+        self.stage_sink = stage_sink
 
     def _settle(self, token: int, usage: Usage | None) -> Settlement:
         if self.kind == JEV_KIND:
@@ -249,6 +261,7 @@ class MeasuredAdapter(ProviderAdapter):
         )
 
     def decide(self, stage: dict, state: dict) -> StageDecision:
+        stage_start = len(self.attempts)
         for attempt in range(1, self.max_retries + 2):
             token = self.ledger.reserve()  # BudgetExceeded propagates (stops run)
             started = timing.monotonic()
@@ -288,6 +301,8 @@ class MeasuredAdapter(ProviderAdapter):
                     actual_model=decision.actual_model,
                     detail=None,
                 )
+                if self.stage_sink is not None:
+                    self.stage_sink(decision, self.attempts[stage_start:])
                 return decision
         raise AssertionError("unreachable retry loop")  # pragma: no cover
 
@@ -367,6 +382,10 @@ class RunStore:
         self.dir = Path(run_dir)
         self.run_path = self.dir / "run.json"
         self.cases_path = self.dir / "cases.jsonl"
+        # One line per completed stage of a (row, provider) workflow, written
+        # before the next stage dispatches so an interrupted multi-stage case
+        # can resume without re-dispatching a stage that already succeeded.
+        self.stages_path = self.dir / "stages.jsonl"
 
     def exists(self) -> bool:
         return self.run_path.is_file()
@@ -395,6 +414,34 @@ class RunStore:
         with self.cases_path.open("a") as handle:
             handle.write(json.dumps(case.as_dict()) + "\n")
 
+    def append_stage(
+        self,
+        row_index: int,
+        requested_model: str,
+        decision: StageDecision,
+        attempts: list[AttemptRecord],
+    ) -> None:
+        """Durably journal one completed stage of a (row, provider) workflow."""
+        entry = {
+            "row_index": row_index,
+            "requested_model": requested_model,
+            "stage": decision.stage,
+            "decision": decision.as_dict(),
+            "attempts": [a.as_dict() for a in attempts],
+        }
+        with self.stages_path.open("a") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    def load_stage_entries(self) -> list[dict]:
+        if not self.stages_path.is_file():
+            return []
+        entries: list[dict] = []
+        for line in self.stages_path.read_text().splitlines():
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+        return entries
+
 
 def _build_case(
     row_index: int,
@@ -403,7 +450,12 @@ def _build_case(
     outcome: workflow.RowOutcome,
     wf_start: float,
     wf_end: float,
+    *,
+    prior_attempts: list[AttemptRecord] | None = None,
 ) -> CaseRecord:
+    # Attempts from a resumed stage (already journaled, never re-dispatched) come
+    # first, then this session's new attempts, preserving stage order.
+    attempts = list(prior_attempts or []) + list(measured.attempts)
     return CaseRecord(
         row_index=row_index,
         requested_model=measured.model_id,
@@ -414,7 +466,7 @@ def _build_case(
         stage_count=outcome.stage_count,
         workflow_started_at=wf_start,
         workflow_ended_at=wf_end,
-        attempts=list(measured.attempts),
+        attempts=attempts,
         detail=outcome.detail,
     )
 
@@ -449,8 +501,18 @@ def run(
     budget refusal stops the run with status ``stopped_budget``; completed cases
     stay recorded and are never re-billed. Returns the final state and cases.
     """
+    # A fresh run must never be started on top of an existing one: that would
+    # duplicate cases and overwrite the prior header. The caller must pick a new
+    # directory or pass resume=True.
+    if not resume and store.exists():
+        raise RunDirectoryError(
+            f"run directory {store.dir} is already occupied by a previous run; "
+            "choose a fresh directory or resume the existing run"
+        )
+
     store.init_dir()
 
+    partial_stages: dict[tuple[int, str], dict[str, tuple[StageDecision, list[AttemptRecord]]]] = {}
     if resume and store.exists():
         state = store.load_state()
         if state.config_hash != config_hash:
@@ -464,13 +526,31 @@ def run(
                 f"(run={state.ordered_record_sha256!r} current={ordered_record_sha256!r})"
             )
         completed = store.load_cases()
-        settlements: list[Settlement] = [s for c in completed for s in c.settlements()]
-        ledger = BudgetLedger.replay(
-            settlements,
-            cap=ledger.cap,
-            pricing=ledger.pricing,
-            planning_seed=ledger.planning_seed,
-        )
+        done_keys_resume = {c.key for c in completed}
+        # Rebuild any partially-completed cases (a stage that succeeded before an
+        # interruption) from the stage journal, skipping pairs already terminal.
+        for entry in store.load_stage_entries():
+            key = (entry["row_index"], entry["requested_model"])
+            if key in done_keys_resume:
+                continue
+            decision = StageDecision.from_dict(entry["decision"])
+            attempts = [AttemptRecord.from_dict(a) for a in entry.get("attempts", [])]
+            partial_stages.setdefault(key, {})[decision.stage] = (decision, attempts)
+        if ledger.store is None:
+            # Unbound ledger: rebuild accounting by replaying every durable
+            # settlement (completed cases plus journaled partial stages). A bound
+            # shared ledger is already authoritative, so it must not be replayed
+            # (its settlements were flushed during the interrupted session).
+            settlements: list[Settlement] = [s for c in completed for s in c.settlements()]
+            for stages in partial_stages.values():
+                for _decision, attempts in stages.values():
+                    settlements.extend(a.settlement() for a in attempts)
+            ledger = BudgetLedger.replay(
+                settlements,
+                cap=ledger.cap,
+                pricing=ledger.pricing,
+                planning_seed=ledger.planning_seed,
+            )
         # Grow (never shrink) the planned population to include any rows this
         # resume adds, so the completion check uses the current intended scope.
         merged = sorted(set(state.planned_row_indices) | {r["index"] for r in rows})
@@ -507,10 +587,22 @@ def run(
                 if key in done_keys:
                     continue
                 inner = adapters[model_id]
-                measured = MeasuredAdapter(inner, ledger, max_retries=max_retries)
+                prior = partial_stages.get(key, {})
+                prior_decisions = {sid: dec for sid, (dec, _atts) in prior.items()}
+                prior_attempts = [a for _sid, (_dec, atts) in prior.items() for a in atts]
+
+                def _sink(decision: StageDecision, attempts: list[AttemptRecord],
+                          _row=row["index"], _model=model_id) -> None:
+                    store.append_stage(_row, _model, decision, attempts)
+
+                measured = MeasuredAdapter(
+                    inner, ledger, max_retries=max_retries, stage_sink=_sink
+                )
                 wf_start = timing.monotonic()
                 try:
-                    outcome = workflow.evaluate_state(measured, row["features"])
+                    outcome = workflow.evaluate_state(
+                        measured, row["features"], prior_stages=prior_decisions
+                    )
                 except BudgetExceeded as exc:
                     stopped = True
                     stop_reason = str(exc)
@@ -519,7 +611,8 @@ def run(
                     raise
                 wf_end = timing.monotonic()
                 case = _build_case(
-                    row["index"], row.get("label"), measured, outcome, wf_start, wf_end
+                    row["index"], row.get("label"), measured, outcome, wf_start, wf_end,
+                    prior_attempts=prior_attempts,
                 )
                 store.append_case(case)
                 completed.append(case)

@@ -36,6 +36,16 @@ class Usage:
             "cost": self.cost,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict | None) -> Usage:
+        if not data:
+            return cls()
+        return cls(
+            input_tokens=data.get("input_tokens"),
+            output_tokens=data.get("output_tokens"),
+            cost=data.get("cost"),
+        )
+
 
 @dataclass(frozen=True)
 class StageDecision:
@@ -59,6 +69,18 @@ class StageDecision:
             "probabilities": self.probabilities,
             "usage": self.usage.as_dict(),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> StageDecision:
+        return cls(
+            stage=data["stage"],
+            requested_model=data["requested_model"],
+            actual_model=data.get("actual_model"),
+            choice=data["choice"],
+            confidence=data.get("confidence"),
+            probabilities=data.get("probabilities"),
+            usage=Usage.from_dict(data.get("usage")),
+        )
 
 
 def _coerce_confidence(value: object) -> float | None:

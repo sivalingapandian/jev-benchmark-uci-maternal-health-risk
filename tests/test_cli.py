@@ -131,3 +131,202 @@ def test_run_blocks_full_eval_on_non_official_population(tmp_path, fixtures_dir,
     assert rc != 0
     err = capsys.readouterr().err.lower()
     assert "official" in err and "population" in err
+
+
+def _write_valid_pilot(tmp_path, data_dir):
+    """A pilot projection that passes every run gate for the prepared data."""
+    provenance = json.loads((data_dir / "provenance.json").read_text())
+    pilot_dir = tmp_path / "pilot"
+    pilot_dir.mkdir(exist_ok=True)
+    (pilot_dir / "projection.json").write_text(
+        json.dumps(
+            {
+                "config_hash": provenance["config_hash"],
+                "ordered_record_sha256": provenance["ordered_record_sha256"],
+                "is_official_population": True,
+                "validated_models": [
+                    "jev-1.13.0",
+                    "openai/gpt-4o-mini",
+                    "google/gemini-2.5-flash",
+                ],
+                "projection": {"affordable": True, "reason": "projected cost fits"},
+            }
+        )
+    )
+    return pilot_dir
+
+
+def test_run_requires_pilot_even_with_narrowed_rows(tmp_path, official_csv, capsys):
+    # --rows must not become a bulk-dispatch bypass: every measured run needs an
+    # affordable pilot that validated all three providers. The gate fires before
+    # any live adapter is built, so no API keys are needed.
+    data_dir = tmp_path / "data"
+    main(["prepare", "--source", str(official_csv), "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "run",
+            "--data-dir",
+            str(data_dir),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--rows",
+            "2",
+            "--budget-state",
+            str(tmp_path / "shared-budget.json"),
+        ]
+    )
+    assert rc != 0
+    assert "pilot" in capsys.readouterr().err.lower()
+
+
+def test_run_rejects_removed_no_require_pilot_flag(tmp_path, official_csv, capsys):
+    # The bypass flag was removed; argparse must reject it outright.
+    data_dir = tmp_path / "data"
+    main(["prepare", "--source", str(official_csv), "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "run",
+                "--data-dir",
+                str(data_dir),
+                "--run-dir",
+                str(tmp_path / "run"),
+                "--no-require-pilot",
+            ]
+        )
+    assert exc.value.code != 0
+
+
+def test_run_refuses_cap_above_approved(tmp_path, official_csv, capsys):
+    # A user-configured cap above the approved $20 fails safely before any paid
+    # call (this guard fires before dataset-gated work touches a provider).
+    data_dir = tmp_path / "data"
+    main(["prepare", "--source", str(official_csv), "--data-dir", str(data_dir)])
+    capsys.readouterr()
+
+    rc = main(
+        [
+            "run",
+            "--data-dir",
+            str(data_dir),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--budget-cap",
+            "25",
+        ]
+    )
+    assert rc != 0
+    err = capsys.readouterr().err.lower()
+    assert "cap" in err and "20" in err
+
+
+def test_run_refuses_occupied_run_dir(tmp_path, official_csv, capsys):
+    # A fresh run on an occupied directory must refuse rather than append
+    # duplicate cases; the guard fires before any live adapter is built.
+    data_dir = tmp_path / "data"
+    main(["prepare", "--source", str(official_csv), "--data-dir", str(data_dir)])
+    capsys.readouterr()
+    pilot_dir = _write_valid_pilot(tmp_path, data_dir)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"run_id": "existing"}))
+
+    rc = main(
+        [
+            "run",
+            "--data-dir",
+            str(data_dir),
+            "--run-dir",
+            str(run_dir),
+            "--pilot-dir",
+            str(pilot_dir),
+            "--budget-state",
+            str(tmp_path / "shared-budget.json"),
+        ]
+    )
+    assert rc != 0
+    assert "occupied" in capsys.readouterr().err.lower()
+
+
+def test_run_refuses_empty_pilot_projection(tmp_path, official_csv, capsys):
+    # An empty pilot (no providers validated) cannot authorize bulk dispatch.
+    data_dir = tmp_path / "data"
+    main(["prepare", "--source", str(official_csv), "--data-dir", str(data_dir)])
+    capsys.readouterr()
+    provenance = json.loads((data_dir / "provenance.json").read_text())
+
+    pilot_dir = tmp_path / "pilot"
+    pilot_dir.mkdir()
+    (pilot_dir / "projection.json").write_text(
+        json.dumps(
+            {
+                "config_hash": provenance["config_hash"],
+                "ordered_record_sha256": provenance["ordered_record_sha256"],
+                "is_official_population": True,
+                "validated_models": [],  # empty evidence
+                "projection": {"affordable": True, "reason": "projected cost fits"},
+            }
+        )
+    )
+
+    rc = main(
+        [
+            "run",
+            "--data-dir",
+            str(data_dir),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--pilot-dir",
+            str(pilot_dir),
+        ]
+    )
+    assert rc != 0
+    assert "pilot" in capsys.readouterr().err.lower()
+
+
+def test_pilot_refuses_cap_above_approved(tmp_path, official_csv, capsys):
+    rc = main(
+        [
+            "pilot",
+            "--source",
+            str(official_csv),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--run-dir",
+            str(tmp_path / "pilot"),
+            "--budget-cap",
+            "30",
+            "--budget-state",
+            str(tmp_path / "shared-budget.json"),
+        ]
+    )
+    assert rc != 0
+    err = capsys.readouterr().err.lower()
+    assert "cap" in err and "20" in err
+
+
+def test_pilot_refuses_occupied_run_dir(tmp_path, official_csv, capsys):
+    run_dir = tmp_path / "pilot"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"run_id": "existing"}))
+
+    rc = main(
+        [
+            "pilot",
+            "--source",
+            str(official_csv),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--run-dir",
+            str(run_dir),
+            "--budget-state",
+            str(tmp_path / "shared-budget.json"),
+        ]
+    )
+    assert rc != 0
+    assert "occupied" in capsys.readouterr().err.lower()

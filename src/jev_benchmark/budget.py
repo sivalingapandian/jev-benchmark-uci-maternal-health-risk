@@ -27,15 +27,28 @@ reservation`` would reach the cap. After the attempt the reservation is
 ``settle``\\ d to a billed amount, a token-rate estimate, or retained as
 unknown. The ledger serialises to JSON and can be rebuilt by replaying the
 per-attempt records of a run, so resume preserves accounting exactly.
+
+One ledger can be bound to a :class:`SharedBudgetStore`, a durable JSON file
+shared across planning readiness, preflight, pilot, measured run and retries.
+Every reservation and settlement is flushed to that file (pending reservations
+included) so an interrupted session's in-flight exposure is recovered on the
+next load instead of being assumed free. :func:`open_shared_budget` initialises
+a fresh file from the planning seed plus historical exposure reconciled from
+prior run directories, and :func:`validate_cap` refuses any configured cap above
+the approved ``$20`` ceiling before paid calls begin.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
-from .errors import BudgetExceeded
+from .errors import BudgetConfigError, BudgetExceeded, HistoricalExposureError
 from .providers.base import Usage
 
+# The approved shared software guard. A user may configure a *lower* cap for a
+# tighter test, but never a higher one: $20 is the mission ceiling.
 CAP_USD = 20.0
 PLANNING_SEED_USD = 0.10
 
@@ -126,6 +139,17 @@ class BudgetLedger:
         self.reserved_unknown = reserved_unknown
         self._outstanding: dict[int, float] = {}
         self._next_token = 1
+        # When bound to a durable store, every reservation and settlement is
+        # flushed so an interrupted process still accounts for in-flight calls.
+        self.store: SharedBudgetStore | None = None
+
+    def bind(self, store: SharedBudgetStore) -> BudgetLedger:
+        self.store = store
+        return self
+
+    def _flush(self) -> None:
+        if self.store is not None:
+            self.store.save(self)
 
     # -- derived exposure ---------------------------------------------------- #
     @property
@@ -175,6 +199,9 @@ class BudgetLedger:
         token = self._next_token
         self._next_token += 1
         self._outstanding[token] = amt
+        # Journal the pending reservation *before* the paid call so an in-flight
+        # attempt that never returns stays accounted for on reload.
+        self._flush()
         return token
 
     def _pop(self, token: int) -> float:
@@ -184,6 +211,7 @@ class BudgetLedger:
         """Settle an OpenRouter attempt to its reported billed cost."""
         self._pop(token)
         self.billed_openrouter += cost
+        self._flush()
         return Settlement(BILLED, cost)
 
     def settle_estimated(self, token: int, usage: Usage | None) -> Settlement:
@@ -191,12 +219,14 @@ class BudgetLedger:
         self._pop(token)
         estimate = self.pricing.jev_estimate(usage)
         self.estimated_jev += estimate
+        self._flush()
         return Settlement(ESTIMATED, estimate)
 
     def settle_unknown(self, token: int) -> Settlement:
         """Retain a reservation as unknown billable exposure (not assumed free)."""
         amount = self._pop(token)
         self.reserved_unknown += amount
+        self._flush()
         return Settlement(RESERVED_UNKNOWN, amount)
 
     def settle_openrouter(self, token: int, usage: Usage | None) -> Settlement:
@@ -208,6 +238,7 @@ class BudgetLedger:
     def release(self, token: int) -> Settlement:
         """Release a reservation with no charge (only when provably not billable)."""
         self._pop(token)
+        self._flush()
         return Settlement(NONE, 0.0)
 
     # -- durability --------------------------------------------------------- #
@@ -259,3 +290,131 @@ class BudgetLedger:
         for settlement in settlements:
             ledger.add_settlement(settlement)
         return ledger
+
+    # -- shared durable state ----------------------------------------------- #
+    def shared_state_dict(self) -> dict:
+        """Durable snapshot for the cross-phase shared ledger file.
+
+        Unlike :meth:`as_dict` (a human-readable run header), this carries the
+        raw pending reservations so an interrupted session's in-flight exposure
+        is preserved on reload.
+        """
+        return {
+            "cap": self.cap,
+            "pricing": self.pricing.as_dict(),
+            "planning_seed": self.planning_seed,
+            "billed_openrouter": self.billed_openrouter,
+            "estimated_jev": self.estimated_jev,
+            "reserved_unknown": self.reserved_unknown,
+            "pending": list(self._outstanding.values()),
+            "exposure": self.exposure,
+            "remaining": self.remaining,
+        }
+
+
+def validate_cap(requested: float) -> float:
+    """Return a usable cap or refuse one above the approved ceiling.
+
+    A user may tighten the guard (a smaller cap) but never raise it: a cap above
+    ``$20`` is refused before any paid call so an over-budget run cannot start.
+    """
+    if requested > CAP_USD:
+        raise BudgetConfigError(
+            f"budget cap ${requested:.2f} exceeds the approved ${CAP_USD:.2f} "
+            "shared ceiling; configure a cap at or below the approved amount"
+        )
+    if requested <= 0:
+        raise BudgetConfigError("budget cap must be positive")
+    return requested
+
+
+def reconcile_historical_exposure(runs_dir: str | Path) -> float:
+    """Sum settled marginal spend recorded by prior run directories.
+
+    Each ``run.json`` carries a budget snapshot. Its settled spend *beyond* the
+    shared planning seed (billed + estimated + retained-unknown + any still
+    outstanding) is folded in so a fresh shared ledger does not forget paid
+    development or planning attempts. A snapshot that cannot be parsed raises
+    :class:`HistoricalExposureError` so the caller can stop rather than guess.
+    """
+    runs_path = Path(runs_dir)
+    if not runs_path.is_dir():
+        return 0.0
+    total = 0.0
+    for run_json in sorted(runs_path.glob("*/run.json")):
+        try:
+            data = json.loads(run_json.read_text())
+            budget = data["budget"]
+            spent = (
+                float(budget.get("billed_openrouter", 0.0))
+                + float(budget.get("estimated_jev", 0.0))
+                + float(budget.get("reserved_unknown", 0.0))
+                + float(budget.get("outstanding_reserved", 0.0))
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise HistoricalExposureError(
+                f"cannot bound historical exposure from {run_json}: {exc}"
+            ) from exc
+        total += max(spent, 0.0)
+    return total
+
+
+class SharedBudgetStore:
+    """Durable JSON file for the single cross-phase shared exposure.
+
+    Planning readiness, preflight, pilot, measured run and retries all load and
+    update the same file, so the ``$20`` guard is one cumulative exposure rather
+    than a fresh allowance per command. Pending reservations recovered from an
+    interrupted session are folded into retained-unknown exposure on load, since
+    an in-flight paid call must never be assumed free.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def exists(self) -> bool:
+        return self.path.is_file()
+
+    def save(self, ledger: BudgetLedger) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(ledger.shared_state_dict(), indent=2) + "\n")
+
+    def load(self) -> BudgetLedger:
+        data = json.loads(self.path.read_text())
+        pending = data.get("pending", []) or []
+        ledger = BudgetLedger(
+            cap=min(float(data.get("cap", CAP_USD)), CAP_USD),
+            pricing=Pricing.from_dict(data.get("pricing")),
+            planning_seed=float(data.get("planning_seed", PLANNING_SEED_USD)),
+            billed_openrouter=float(data.get("billed_openrouter", 0.0)),
+            estimated_jev=float(data.get("estimated_jev", 0.0)),
+            reserved_unknown=float(data.get("reserved_unknown", 0.0))
+            + sum(float(p) for p in pending),
+        )
+        ledger.store = self
+        return ledger
+
+
+def open_shared_budget(
+    path: str | Path,
+    *,
+    cap: float = CAP_USD,
+    runs_dir: str | Path | None = None,
+) -> BudgetLedger:
+    """Open (or initialise) the one durable shared ledger bound to ``path``.
+
+    An existing file is loaded and its cap clamped to the approved ceiling and
+    the (possibly lower) requested cap. A fresh file starts from the planning
+    seed plus any historical exposure reconciled from ``runs_dir``.
+    """
+    cap = validate_cap(cap)
+    store = SharedBudgetStore(path)
+    if store.exists():
+        ledger = store.load()
+        ledger.cap = min(ledger.cap, cap)
+        return ledger
+    historical = reconcile_historical_exposure(runs_dir) if runs_dir else 0.0
+    ledger = BudgetLedger(cap=cap, reserved_unknown=historical)
+    ledger.store = store
+    store.save(ledger)
+    return ledger

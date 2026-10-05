@@ -81,3 +81,24 @@ class RunIdentityError(BenchmarkError):
     Reusing results from a different dataset or frozen specification would
     silently mix incompatible experiments, so resume refuses instead.
     """
+
+
+class RunDirectoryError(BenchmarkError):
+    """A fresh (non-resume) run was pointed at an already-occupied directory.
+
+    Appending a new run on top of an existing one would duplicate cases and
+    overwrite the prior header, so a fresh run refuses an occupied directory and
+    the user must choose a new directory or pass ``--resume``.
+    """
+
+
+class BudgetConfigError(BenchmarkError):
+    """A user-configured budget cap is invalid (e.g. above the approved $20)."""
+
+
+class HistoricalExposureError(BenchmarkError):
+    """Prior paid exposure recorded on disk could not be safely bounded.
+
+    Rather than guess, the shared budget refuses to initialise so the operator
+    can reconcile the historical spend before any further paid calls.
+    """

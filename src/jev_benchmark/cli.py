@@ -37,12 +37,23 @@ from pathlib import Path
 
 from . import pilot as pilot_mod
 from . import runinspect, runner, spec
-from .budget import CAP_USD, BudgetLedger
+from .budget import CAP_USD, open_shared_budget, validate_cap
 from .dataset import PreparedDataset, prepare_dataset, save_prepared
-from .errors import BenchmarkError, ProviderRequestError, RunIdentityError, SourceError
+from .errors import (
+    BenchmarkError,
+    BudgetConfigError,
+    HistoricalExposureError,
+    ProviderRequestError,
+    RunDirectoryError,
+    RunIdentityError,
+    SourceError,
+)
 from .preflight import run_preflight_from_env
 from .providers import JevAdapter, OpenRouterAdapter
+from .providers.base import Usage
 from .runner import RunStore
+
+DEFAULT_BUDGET_STATE = "runs/shared-budget.json"
 
 
 def _print_header(title: str) -> None:
@@ -213,6 +224,19 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             print(f"    detail         : {provider.detail}")
         print()
 
+    # Preflight spends real money, so its exposure joins the one shared ledger
+    # before any pilot/run can draw on the remaining budget.
+    try:
+        ledger = open_shared_budget(
+            args.budget_state, cap=CAP_USD, runs_dir=Path(args.budget_state).parent
+        )
+    except (HistoricalExposureError, BudgetConfigError) as exc:
+        print(f"preflight blocked: {exc}", file=sys.stderr)
+        return 1
+    _charge_preflight(ledger, result)
+    print()
+    _print_accounting(ledger.as_dict())
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -280,6 +304,28 @@ def _close_adapters(adapters: dict) -> None:
             pass
 
 
+def _charge_preflight(ledger, result) -> None:
+    """Fold observed preflight usage into the shared ledger.
+
+    Each provider's aggregate usage is reserved then settled: OpenRouter to its
+    billed cost when reported (else retained-unknown), Jev to a published-rate
+    token estimate. A near-cap refusal would raise, which is acceptable because
+    preflight must not proceed past the shared guard either.
+    """
+    for provider in result.providers:
+        totals = provider.usage_totals
+        usage = Usage(
+            input_tokens=totals.get("input_tokens"),
+            output_tokens=totals.get("output_tokens"),
+            cost=totals.get("cost"),
+        )
+        token = ledger.reserve()
+        if runner.provider_kind(provider.requested_model) == runner.JEV_KIND:
+            ledger.settle_estimated(token, usage)
+        else:
+            ledger.settle_openrouter(token, usage)
+
+
 def _print_accounting(budget: dict) -> None:
     print("accounting (conservative, redacted):")
     print(f"  planning seed        : ${budget.get('planning_seed', 0.0):.6f}")
@@ -298,14 +344,34 @@ def cmd_pilot(args: argparse.Namespace) -> int:
     config_hash = dataset.provenance["config_hash"]
     ordered_hash = dataset.provenance["ordered_record_sha256"]
 
-    ledger = BudgetLedger(cap=args.budget_cap)
+    # Fail safely before any paid call: refuse an over-cap guard or an occupied
+    # directory, and open the one shared ledger (seed + reconciled history).
+    try:
+        cap = validate_cap(args.budget_cap)
+    except BudgetConfigError as exc:
+        print(f"pilot blocked: {exc}", file=sys.stderr)
+        return 1
+    store = RunStore(args.run_dir)
+    if store.exists():
+        print(
+            f"pilot blocked: run directory {store.dir} is already occupied; "
+            "choose a fresh --run-dir.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        ledger = open_shared_budget(
+            args.budget_state, cap=cap, runs_dir=Path(args.budget_state).parent
+        )
+    except (HistoricalExposureError, BudgetConfigError) as exc:
+        print(f"pilot blocked: {exc}", file=sys.stderr)
+        return 1
+
     try:
         adapters = _build_live_adapters(env)
     except ProviderRequestError as exc:
         print(f"pilot blocked: {exc}", file=sys.stderr)
         return 1
-
-    store = RunStore(args.run_dir)
     try:
         result = runner.run(
             store=store,
@@ -401,73 +467,92 @@ def cmd_run(args: argparse.Namespace) -> int:
     config_hash = dataset.provenance["config_hash"]
     ordered_hash = dataset.provenance["ordered_record_sha256"]
     is_official_population = bool(dataset.provenance.get("is_official_population"))
-    is_full_population = len(rows) >= spec.EXPECTED_ROW_COUNT
     # Default (``--rows`` unset) means the complete benchmark over every source
     # row; that is a full paid evaluation and is only valid for the official
-    # 1,014-row population. A short arbitrary CSV may only run an explicit,
-    # smaller ``--rows N`` test, never the full benchmark.
+    # 1,014-row population.
     wants_full_population = args.rows is None
+
+    # Fail safely before any paid call: refuse an over-cap guard first.
+    try:
+        cap = validate_cap(args.budget_cap)
+    except BudgetConfigError as exc:
+        print(f"run blocked: {exc}", file=sys.stderr)
+        return 1
 
     if wants_full_population and not is_official_population:
         print(
             "run blocked: a full paid evaluation requires the official "
             f"{spec.EXPECTED_ROW_COUNT}-row UCI population, but the prepared data has "
             f"{len(rows)} rows and is not the official population. "
-            "Prepare the official dataset, or pass an explicit --rows N for a small "
-            "non-official test run.",
+            "Prepare the official dataset first.",
             file=sys.stderr,
         )
         return 1
 
-    # Gate: a full-population run must be preceded by an affordable pilot
-    # projection for the same frozen configuration.
-    if args.pilot_dir:
-        projection = _load_projection(args.pilot_dir)
-        if projection.get("config_hash") != config_hash:
-            print(
-                "run blocked: pilot projection was made for a different frozen "
-                "configuration; re-run the pilot.",
-                file=sys.stderr,
-            )
-            return 1
-        if projection.get("ordered_record_sha256") != ordered_hash:
-            print(
-                "run blocked: pilot projection was made for a different dataset "
-                "(ordered-record hash mismatch); re-run the pilot on this data.",
-                file=sys.stderr,
-            )
-            return 1
-        if not projection.get("projection", {}).get("affordable", False):
-            print(
-                "run blocked: pilot projects the full run would reach the shared "
-                f"budget cap. {projection['projection'].get('reason', '')}",
-                file=sys.stderr,
-            )
-            return 1
-        # Bulk dispatch requires successful validating evidence for all three
-        # real provider IDs; an affordable pilot that failed to validate a
-        # provider cannot authorize paid execution for it.
-        validated = set(projection.get("validated_models", []))
-        missing = sorted(set(spec.MODEL_IDS) - validated)
-        if missing:
-            print(
-                "run blocked: pilot did not supply valid live evidence for all "
-                f"three approved providers (missing/invalid: {missing}). Re-run "
-                "the pilot or preflight so every provider validates before any "
-                "bulk paid dispatch.",
-                file=sys.stderr,
-            )
-            return 1
-    elif is_full_population and args.require_pilot:
+    # Every measured run is a bulk paid dispatch and must be authorized by an
+    # affordable, config-matching pilot that validated all three providers.
+    # Neither a narrowed ``--rows`` scope nor any bypass flag can skip this gate.
+    if not args.pilot_dir:
         print(
-            "run blocked: a full-population run requires an affordable pilot "
-            "projection (pass --pilot-dir); no bulk paid run starts before a pilot.",
+            "run blocked: a measured run requires an affordable pilot projection "
+            "(pass --pilot-dir); no bulk paid run starts before a pilot validates "
+            "all three providers.",
+            file=sys.stderr,
+        )
+        return 1
+    projection = _load_projection(args.pilot_dir)
+    if projection.get("config_hash") != config_hash:
+        print(
+            "run blocked: pilot projection was made for a different frozen "
+            "configuration; re-run the pilot.",
+            file=sys.stderr,
+        )
+        return 1
+    if projection.get("ordered_record_sha256") != ordered_hash:
+        print(
+            "run blocked: pilot projection was made for a different dataset "
+            "(ordered-record hash mismatch); re-run the pilot on this data.",
+            file=sys.stderr,
+        )
+        return 1
+    if not projection.get("projection", {}).get("affordable", False):
+        print(
+            "run blocked: pilot projects the full run would reach the shared "
+            f"budget cap. {projection.get('projection', {}).get('reason', '')}",
+            file=sys.stderr,
+        )
+        return 1
+    # Bulk dispatch requires successful validating evidence for all three real
+    # provider IDs; an empty, incomplete, or mismatched pilot cannot authorize it.
+    validated = set(projection.get("validated_models", []))
+    missing = sorted(set(spec.MODEL_IDS) - validated)
+    if missing:
+        print(
+            "run blocked: pilot did not supply valid live evidence for all "
+            f"three approved providers (missing/invalid: {missing}). Re-run "
+            "the pilot or preflight so every provider validates before any "
+            "bulk paid dispatch.",
             file=sys.stderr,
         )
         return 1
 
-    ledger = BudgetLedger(cap=args.budget_cap)
     store = RunStore(args.run_dir)
+    if not args.resume and store.exists():
+        print(
+            f"run blocked: run directory {store.dir} is already occupied by a "
+            "previous run; choose a fresh --run-dir or pass --resume.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        ledger = open_shared_budget(
+            args.budget_state, cap=cap, runs_dir=Path(args.budget_state).parent
+        )
+    except (HistoricalExposureError, BudgetConfigError) as exc:
+        print(f"run blocked: {exc}", file=sys.stderr)
+        return 1
+
     try:
         adapters = _build_live_adapters(env)
     except ProviderRequestError as exc:
@@ -489,6 +574,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     except RunIdentityError as exc:
         print(f"resume blocked: {exc}", file=sys.stderr)
+        return 1
+    except RunDirectoryError as exc:
+        print(f"run blocked: {exc}", file=sys.stderr)
         return 1
     finally:
         _close_adapters(adapters)
@@ -630,6 +718,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="runs/preflight",
         help="Directory for the redacted preflight record (default: runs/preflight).",
     )
+    p_preflight.add_argument(
+        "--budget-state",
+        default=DEFAULT_BUDGET_STATE,
+        help="Shared durable budget file (default: runs/shared-budget.json).",
+    )
     p_preflight.set_defaults(func=cmd_preflight)
 
     p_pilot = sub.add_parser(
@@ -653,7 +746,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-retries", type=int, default=2, help="Bounded retries per stage (default: 2)."
     )
     p_pilot.add_argument(
-        "--budget-cap", type=float, default=CAP_USD, help="Shared budget cap (default: 20)."
+        "--budget-cap",
+        type=float,
+        default=CAP_USD,
+        help="Shared budget cap; a value above the approved $20 is refused (default: 20).",
+    )
+    p_pilot.add_argument(
+        "--budget-state",
+        default=DEFAULT_BUDGET_STATE,
+        help="Shared durable budget file (default: runs/shared-budget.json).",
     )
     p_pilot.add_argument(
         "--safety-factor",
@@ -687,7 +788,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--pilot-dir",
         default=None,
-        help="Pilot directory whose affordable projection gates this run.",
+        help="Pilot directory whose affordable projection gates this run (required).",
     )
     p_run.add_argument(
         "--resume",
@@ -698,15 +799,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-retries", type=int, default=2, help="Bounded retries per stage (default: 2)."
     )
     p_run.add_argument(
-        "--budget-cap", type=float, default=CAP_USD, help="Shared budget cap (default: 20)."
+        "--budget-cap",
+        type=float,
+        default=CAP_USD,
+        help="Shared budget cap; a value above the approved $20 is refused (default: 20).",
     )
     p_run.add_argument(
-        "--no-require-pilot",
-        dest="require_pilot",
-        action="store_false",
-        help="Allow a full-population run without a pilot projection (not recommended).",
+        "--budget-state",
+        default=DEFAULT_BUDGET_STATE,
+        help="Shared durable budget file (default: runs/shared-budget.json).",
     )
-    p_run.set_defaults(func=cmd_run, require_pilot=True)
+    p_run.set_defaults(func=cmd_run)
 
     p_run_inspect = sub.add_parser(
         "run-inspect",
