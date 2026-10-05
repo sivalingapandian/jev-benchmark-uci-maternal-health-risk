@@ -76,6 +76,27 @@ def test_preflight_fails_when_one_provider_is_invalid():
     assert bad.outcome == workflow.INVALID
 
 
+def test_preflight_fails_when_usage_is_missing():
+    # A valid predicted decision that reports no usage tokens is treated as
+    # unknown, not a pass: missing usage cannot be a complete preflight.
+    no_usage = StageDecision(
+        stage="stage1",
+        requested_model="jev-1.13.0",
+        actual_model="jev-1.13.0",
+        choice="high",
+        confidence=0.8,
+        probabilities=None,
+        usage=Usage(),
+    )
+    adapters = _all_ok_adapters()
+    adapters[0] = ScriptedAdapter("jev-1.13.0", {"stage1": no_usage})
+    result = run_preflight(adapters)
+    assert result.ok is False
+    jev = next(p for p in result.providers if p.requested_model == "jev-1.13.0")
+    assert jev.ok is False
+    assert jev.outcome == workflow.PREDICTED  # it predicted, but usage was unknown
+
+
 def test_preflight_fails_when_a_model_is_missing():
     adapters = _all_ok_adapters()[:2]  # drop gemini
     result = run_preflight(adapters)

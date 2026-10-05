@@ -99,7 +99,7 @@ class FakeJevClient:
 def test_jev_returns_validated_decision_and_usage():
     client = FakeJevClient({"stage1": ("high", 0.9, {"high": 0.9, "other": 0.1})})
     adapter = JevAdapter(client=client, model_id="jev-1.13.0")
-    decision = adapter.decide(spec.STAGE1, {"Age": 30})
+    decision = adapter.decide(spec.STAGE1, STATE)
     assert decision.choice == "high"
     assert decision.actual_model == "jev-1.13.0"
     assert decision.usage.input_tokens == 10
@@ -107,11 +107,23 @@ def test_jev_returns_validated_decision_and_usage():
     assert decision.usage.cost is None  # Jev has no billed-dollar field
 
 
+def test_jev_only_sends_six_permitted_features():
+    # Jev is built from the same six-feature allowlist as OpenRouter: RiskLevel
+    # and any extra caller fields are dropped before the request leaves.
+    client = FakeJevClient({"stage1": ("high", 0.9, {"high": 0.9, "other": 0.1})})
+    adapter = JevAdapter(client=client, model_id="jev-1.13.0")
+    adapter.decide(spec.STAGE1, {**STATE, "RiskLevel": "high risk", "caller_note": "x"})
+    (_stage_id, sent_state, _model) = client.calls[-1]
+    assert set(sent_state) == set(spec.FEATURE_COLUMNS)
+    assert "RiskLevel" not in sent_state
+    assert "caller_note" not in sent_state
+
+
 def test_jev_rejects_model_identity_mismatch():
     client = FakeJevClient({"stage1": ("high", 0.9, None)}, model="jev-9.9.9")
     adapter = JevAdapter(client=client, model_id="jev-1.13.0")
     with pytest.raises(ModelMismatchError) as exc:
-        adapter.decide(spec.STAGE1, {"Age": 30})
+        adapter.decide(spec.STAGE1, STATE)
     assert exc.value.actual_model == "jev-9.9.9"
 
 
@@ -119,7 +131,7 @@ def test_jev_rejects_choice_outside_criteria():
     client = FakeJevClient({"stage1": ("maybe", 0.5, None)})
     adapter = JevAdapter(client=client, model_id="jev-1.13.0")
     with pytest.raises(InvalidDecisionError):
-        adapter.decide(spec.STAGE1, {"Age": 30})
+        adapter.decide(spec.STAGE1, STATE)
 
 
 def test_jev_maps_sdk_error_to_request_error():
@@ -128,7 +140,7 @@ def test_jev_maps_sdk_error_to_request_error():
     client = FakeJevClient({}, raise_exc=ts.TypeSafeAPIConnectionError("boom"))
     adapter = JevAdapter(client=client, model_id="jev-1.13.0")
     with pytest.raises(ProviderRequestError):
-        adapter.decide(spec.STAGE1, {"Age": 30})
+        adapter.decide(spec.STAGE1, STATE)
 
 
 # --------------------------------------------------------------------------- #
@@ -207,6 +219,28 @@ def test_openrouter_rejects_substituted_model():
     resp = _make_openrouter_response(content=payload, model="anthropic/claude-3-haiku")
     adapter = OpenRouterAdapter("openai/gpt-4o-mini", client=FakeOpenRouterClient(resp))
     with pytest.raises(ModelMismatchError):
+        adapter.decide(spec.STAGE1, STATE)
+
+
+def test_openrouter_rejects_model_variant_suffix():
+    # A different model variant (``-lite``) is not a dated snapshot and must be
+    # rejected rather than accepted as an arbitrary prefix match.
+    payload = json.dumps(
+        {"choice": "high", "confidence": 0.9, "probabilities": {"high": 0.9, "other": 0.1}}
+    )
+    resp = _make_openrouter_response(content=payload, model="google/gemini-2.5-flash-lite")
+    adapter = OpenRouterAdapter("google/gemini-2.5-flash", client=FakeOpenRouterClient(resp))
+    with pytest.raises(ModelMismatchError):
+        adapter.decide(spec.STAGE1, STATE)
+
+
+def test_openrouter_requires_probabilities_in_structured_output():
+    # The structured schema marks probabilities required; the parser agrees, so
+    # a complete response that omits them is invalid rather than a usable label.
+    payload = json.dumps({"choice": "high", "confidence": 0.9})
+    resp = _make_openrouter_response(content=payload)  # finish_reason="stop"
+    adapter = OpenRouterAdapter("openai/gpt-4o-mini", client=FakeOpenRouterClient(resp))
+    with pytest.raises(InvalidDecisionError):
         adapter.decide(spec.STAGE1, STATE)
 
 

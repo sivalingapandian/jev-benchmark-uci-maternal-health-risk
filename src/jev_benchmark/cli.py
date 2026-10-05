@@ -355,11 +355,20 @@ def cmd_pilot(args: argparse.Namespace) -> int:
     print(f"projected total exposure    : ${projection.projected_total_exposure:.6f}")
     print(f"affordable within ${projection.cap:.2f}: {projection.affordable}")
     print(f"decision: {projection.reason}")
+    validated = pilot_mod.validated_models(cases)
+    print(f"providers with valid live evidence: {validated}")
+    missing_validation = sorted(set(spec.MODEL_IDS) - set(validated))
+    if missing_validation:
+        print(
+            "note: these providers lack valid live evidence and cannot be "
+            f"bulk-dispatched: {missing_validation}"
+        )
 
     out = {
         "config_hash": config_hash,
         "ordered_record_sha256": ordered_hash,
         "is_official_population": bool(dataset.provenance.get("is_official_population")),
+        "validated_models": validated,
         "run_dir": str(store.dir),
         "projection": projection.as_dict(),
         "budget": ledger.as_dict(),
@@ -432,6 +441,20 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(
                 "run blocked: pilot projects the full run would reach the shared "
                 f"budget cap. {projection['projection'].get('reason', '')}",
+                file=sys.stderr,
+            )
+            return 1
+        # Bulk dispatch requires successful validating evidence for all three
+        # real provider IDs; an affordable pilot that failed to validate a
+        # provider cannot authorize paid execution for it.
+        validated = set(projection.get("validated_models", []))
+        missing = sorted(set(spec.MODEL_IDS) - validated)
+        if missing:
+            print(
+                "run blocked: pilot did not supply valid live evidence for all "
+                f"three approved providers (missing/invalid: {missing}). Re-run "
+                "the pilot or preflight so every provider validates before any "
+                "bulk paid dispatch.",
                 file=sys.stderr,
             )
             return 1

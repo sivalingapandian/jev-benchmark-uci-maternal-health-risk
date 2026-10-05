@@ -75,6 +75,44 @@ def test_prepare_labels_short_csv_as_non_official(tmp_path, fixtures_dir, capsys
     assert provenance["is_official_population"] is False
 
 
+def test_run_blocks_when_pilot_lacks_three_provider_validation(tmp_path, official_csv, capsys):
+    # Bulk dispatch requires successful validating evidence for all three real
+    # provider IDs. An affordable pilot that only validated two providers must
+    # not authorize the full paid run. The gate fires before any live adapter is
+    # built, so no API keys are needed.
+    data_dir = tmp_path / "data"
+    main(["prepare", "--source", str(official_csv), "--data-dir", str(data_dir)])
+    capsys.readouterr()
+    provenance = json.loads((data_dir / "provenance.json").read_text())
+
+    pilot_dir = tmp_path / "pilot"
+    pilot_dir.mkdir()
+    projection = {
+        "config_hash": provenance["config_hash"],
+        "ordered_record_sha256": provenance["ordered_record_sha256"],
+        "is_official_population": True,
+        "validated_models": ["jev-1.13.0", "openai/gpt-4o-mini"],  # gemini missing
+        "projection": {"affordable": True, "reason": "projected cost fits"},
+    }
+    (pilot_dir / "projection.json").write_text(json.dumps(projection))
+
+    rc = main(
+        [
+            "run",
+            "--data-dir",
+            str(data_dir),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--pilot-dir",
+            str(pilot_dir),
+        ]
+    )
+    assert rc != 0
+    err = capsys.readouterr().err.lower()
+    assert "gemini" in err
+    assert "provider" in err
+
+
 def test_run_blocks_full_eval_on_non_official_population(tmp_path, fixtures_dir, capsys):
     # A full paid evaluation (default --rows => full population) must be refused
     # when the prepared data is not the official 1,014-row population. The guard

@@ -38,6 +38,25 @@ def _case(model, cost_basis, amount, row=0):
     )
 
 
+def test_validated_models_requires_predicted_with_usage():
+    # A pilot supplies preflight-equivalent evidence only for providers that
+    # returned at least one valid predicted case with known usage.
+    jev = _case("jev-1.13.0", ESTIMATED, 0.00001)
+    gpt = _case("openai/gpt-4o-mini", BILLED, 0.00002)
+    gemini = _case("google/gemini-2.5-flash", BILLED, 0.0)
+    gemini.outcome = "invalid"  # provider failed to validate
+    validated = pilot.validated_models([jev, gpt, gemini])
+    assert "jev-1.13.0" in validated
+    assert "openai/gpt-4o-mini" in validated
+    assert "google/gemini-2.5-flash" not in validated
+
+
+def test_validated_models_excludes_predicted_without_usage():
+    case = _case("jev-1.13.0", ESTIMATED, 0.0)
+    case.attempts[0].input_tokens = None  # no usage recorded
+    assert pilot.validated_models([case]) == []
+
+
 def test_cheap_pilot_projects_affordable():
     cases = [
         _case("jev-1.13.0", ESTIMATED, 0.00001),

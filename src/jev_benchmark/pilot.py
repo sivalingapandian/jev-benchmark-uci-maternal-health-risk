@@ -17,11 +17,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import workflow
 from .budget import BILLED, ESTIMATED, RESERVED_UNKNOWN, BudgetLedger
 from .runner import CaseRecord
 
 FULL_POPULATION_ROWS = 1014
 DEFAULT_SAFETY_FACTOR = 2.0
+
+
+def validated_models(cases: list[CaseRecord]) -> list[str]:
+    """Model IDs with preflight-equivalent evidence from the pilot.
+
+    A provider counts as validated only when at least one pilot case returned a
+    complete, schema-valid prediction with known usage. Invalid/refused/error
+    outcomes or a prediction without accountable usage do not count, so a pilot
+    cannot authorize a bulk run for a provider that never actually validated.
+    """
+    ok: set[str] = set()
+    for case in cases:
+        if case.outcome != workflow.PREDICTED:
+            continue
+        if any(a.input_tokens is not None for a in case.attempts):
+            ok.add(case.requested_model)
+    return sorted(ok)
 
 
 @dataclass

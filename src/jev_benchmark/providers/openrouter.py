@@ -56,8 +56,17 @@ def _model_matches(requested: str, actual: str | None) -> bool:
         return True
     a = actual.strip().lower()
     r = requested.strip().lower()
-    # Accept dated snapshots of the same model (prefix) but reject a different one.
-    return a == r or a.startswith(r)
+    if a == r:
+        return True
+    # Accept only a dated/versioned snapshot of the *same* model: the requested
+    # id followed by a separator and a digit (e.g. "...-2024-07-18"). A lexical
+    # variant such as "...-lite" or "...-high" is a different model and must be
+    # rejected rather than matched as an arbitrary prefix.
+    for sep in ("-", ":", "@"):
+        prefix = r + sep
+        if a.startswith(prefix) and a[len(prefix) : len(prefix) + 1].isdigit():
+            return True
+    return False
 
 
 class OpenRouterAdapter(ProviderAdapter):
@@ -167,11 +176,16 @@ class OpenRouterAdapter(ProviderAdapter):
             )
 
         try:
+            # The structured schema marks ``probabilities`` required, so the
+            # local parser requires them too: the schema and parser agree, and a
+            # response missing/malforming required output is an invalid outcome
+            # rather than a usable label.
             choice, confidence, probabilities = validate_choice_response(
                 payload.get("choice"),
                 stage["choices"],
                 confidence=payload.get("confidence"),
                 probabilities=payload.get("probabilities"),
+                require_probabilities=True,
             )
         except InvalidDecisionError as exc:
             exc.usage = usage

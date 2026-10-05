@@ -8,6 +8,7 @@ cannot be scored.
 
 from __future__ import annotations
 
+from .. import spec
 from ..errors import (
     InvalidDecisionError,
     ModelMismatchError,
@@ -41,13 +42,16 @@ class JevAdapter(ProviderAdapter):
     def decide(self, stage: dict, state: dict) -> StageDecision:
         import typesafe_sdk as ts
 
+        # Build the request from the same six-feature allowlist OpenRouter uses:
+        # RiskLevel and any extra caller fields are dropped before it is sent.
+        features = spec.serialize_features(state)
         question = ts.Choice(
             instructions=stage["instructions"],
             criteria={choice: None for choice in stage["choices"]},
         )
         try:
             response = self._client.system_one(
-                state=state,
+                state=features,
                 questions={stage["id"]: question},
                 model=self.model_id,
             )

@@ -90,20 +90,33 @@ def _sum_usage(usages: list[Usage]) -> dict:
     }
 
 
+def _usage_known(usages: list[Usage]) -> bool:
+    """Every completed stage must report token usage.
+
+    Missing usage is treated as unknown, never free and never a pass: a provider
+    that returned a label but no accountable usage cannot be a complete preflight.
+    """
+    return bool(usages) and all(u.input_tokens is not None for u in usages)
+
+
 def preflight_provider(adapter: ProviderAdapter, state: dict | None = None) -> ProviderPreflight:
     """Run one provider through the full two-stage task and summarise it."""
     state = SYNTHETIC_STATE if state is None else state
     outcome = workflow.evaluate_state(adapter, state)
+    usage_known = _usage_known(outcome.usages)
+    detail = outcome.detail
+    if outcome.outcome == workflow.PREDICTED and not usage_known:
+        detail = "provider returned a label but reported no usage (unknown, not a pass)"
     return ProviderPreflight(
         requested_model=adapter.model_id,
-        ok=outcome.outcome == workflow.PREDICTED,
+        ok=outcome.outcome == workflow.PREDICTED and usage_known,
         outcome=outcome.outcome,
         actual_model=outcome.actual_model,
         final_label=outcome.final_label,
         stage_count=outcome.stage_count,
         stages=[s.as_dict() for s in outcome.stages],
         usage_totals=_sum_usage(outcome.usages),
-        detail=outcome.detail,
+        detail=detail,
     )
 
 
