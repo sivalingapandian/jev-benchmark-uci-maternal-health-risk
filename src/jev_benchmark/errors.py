@@ -17,3 +17,43 @@ class SourceError(BenchmarkError):
 
 class SchemaError(BenchmarkError):
     """The source columns or labels do not match the frozen specification."""
+
+
+class ProviderError(BenchmarkError):
+    """Base class for a failed provider stage request.
+
+    Carries optional redacted metadata so a caller can record usage and the
+    actually-returned model identity even when the decision itself is unusable.
+    Never put secrets or raw authorization data on these.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: object | None = None,
+        actual_model: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.usage = usage
+        self.actual_model = actual_model
+
+
+class ProviderRequestError(ProviderError):
+    """Transport, HTTP, authentication, or timeout failure reaching a provider."""
+
+
+class InvalidDecisionError(ProviderError):
+    """A response did not validate: malformed JSON/choice, missing required field,
+    out-of-range probability, or an incomplete (truncated) answer."""
+
+
+class RefusalError(ProviderError):
+    """The provider explicitly refused to answer the bounded question."""
+
+
+class ModelMismatchError(ProviderError):
+    """The provider exposed a model identity other than the requested one.
+
+    A silent substitution must block the benchmark rather than be scored.
+    """

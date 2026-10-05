@@ -9,10 +9,11 @@ the existing public **UCI Maternal Health Risk** labels (dataset 863, CC BY 4.0)
 
 ## Status
 
-This repository is being built milestone by milestone. The current milestone
-provides the local Python package, pinned dependencies, and the deterministic
-data preparation / inspection CLI. Live provider adapters, the budgeted runner,
-and the results notebook/README arrive in later milestones.
+This repository is being built milestone by milestone. It currently provides
+the local Python package, pinned dependencies, the deterministic data
+preparation / inspection CLI, the shared two-stage decision workflow, live Jev
+and OpenRouter adapters, and a small live `preflight` check. The budgeted
+runner and the results notebook/README arrive in later milestones.
 
 ## Setup
 
@@ -47,6 +48,11 @@ The package installs a `jev-benchmark` console script (equivalently
 # Review the frozen pre-run definition: planned population, source, input
 # features, pinned model IDs, two-stage task, and frozen identifiers
 .venv/bin/jev-benchmark inspect
+
+# Make one small, genuine live request to all three approved models with the
+# shared two-stage task and validate schema/identity/usage before any bulk run.
+# Requires API keys and makes a small paid request.
+.venv/bin/jev-benchmark preflight
 ```
 
 `prepare` writes to `data/`:
@@ -59,6 +65,15 @@ The package installs a `jev-benchmark` console script (equivalently
   feature vectors, conflicting-label groups)
 
 Read a local copy instead of fetching with `--source path/to.csv`.
+
+`preflight` runs the shared two-stage task once per provider against a
+synthetic, non-patient record. Each provider answers stage 1 (`high` vs
+`other`); only its *own* `other` answer triggers its stage 2 (`mid` vs `low`),
+and the label is never sent. Every response is validated for schema, exposed
+model identity, and usage. A missing credential, unsupported schema, refusal,
+invalid decision, or identity mismatch makes that provider fail, the command
+exit non-zero, and bulk execution is blocked. A redacted record (no keys or
+authorization data) is written under `runs/preflight/` (git-ignored).
 
 ## Dataset facts and known discrepancy
 

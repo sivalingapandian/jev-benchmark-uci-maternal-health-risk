@@ -40,18 +40,36 @@ MODEL_IDS: tuple[str, ...] = (
 )
 
 # Canonical two-stage task. Each provider answers stage 1 against the same row;
-# only its own ``other`` answer triggers its own stage 2.
+# only its own ``other`` answer triggers its own stage 2. The instructions are
+# frozen prose shared verbatim by every provider so the question semantics are
+# equivalent; they are never tuned against measured outcomes.
+STAGE1_INSTRUCTIONS = (
+    "You are classifying a single maternal-health record described only by six "
+    "routine measurements. Decide whether this record is HIGH risk or not. "
+    "Answer with exactly one choice: 'high' if it is high risk, or 'other' if it "
+    "is not high risk (that is, mid or low risk)."
+)
+STAGE2_INSTRUCTIONS = (
+    "This maternal-health record has already been judged to be NOT high risk. "
+    "Using only the six routine measurements, decide whether it is mid risk or "
+    "low risk. Answer with exactly one choice: 'mid' or 'low'."
+)
+
 STAGE1 = {
     "id": "stage1",
     "name": "high risk rather than mid/low risk?",
     "choices": ("high", "other"),
+    "instructions": STAGE1_INSTRUCTIONS,
 }
 STAGE2 = {
     "id": "stage2",
     "name": "mid risk rather than low risk?",
     "choices": ("mid", "low"),
     "gated_by": "stage1 == other",
+    "instructions": STAGE2_INSTRUCTIONS,
 }
+
+STAGES = (STAGE1, STAGE2)
 
 # How stage answers compose into a published label.
 LABEL_MAPPING = {
@@ -132,6 +150,24 @@ def serialize_features(row: dict) -> dict:
     if missing:
         raise KeyError(f"row is missing required feature(s): {missing}")
     return {c: row[c] for c in FEATURE_COLUMNS}
+
+
+def build_user_prompt(stage: dict, state: dict) -> str:
+    """Build the equivalent natural-language prompt for a text-completion provider.
+
+    The same frozen instructions and the same six serialized measurements that a
+    structured provider receives are rendered here as one user message. The
+    ``RiskLevel`` label is never part of ``state`` and so can never appear.
+    """
+    choices = stage["choices"]
+    measurements = json.dumps(serialize_features(state), sort_keys=True)
+    return (
+        f"{stage['instructions']}\n\n"
+        f"Record measurements (JSON): {measurements}\n\n"
+        f"Respond with structured JSON. The 'choice' field must be exactly one of "
+        f"{list(choices)}. Also report 'confidence' (0-1) and 'probabilities', a "
+        f"mapping from each of {list(choices)} to its probability (0-1)."
+    )
 
 
 def compose_label(stage1_answer: str, stage2_answer: str | None = None) -> str:
