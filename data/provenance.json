@@ -3,7 +3,10 @@
   "source_data_url": "https://archive.ics.uci.edu/static/public/863/data.csv",
   "license": "CC BY 4.0",
   "citation": "Ahmed, Marzia. (2020). Maternal Health Risk [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5DP5D",
-  "retrieval_date": "2026-10-05",
+  "source_origin": "official_url",
+  "is_official_population": true,
+  "expected_row_count": 1014,
+  "retrieval_date": "2026-10-06",
   "bytes_sha256": "a1f7025719f84715096e0d1f95ae2e56b57809b9b15449e1836c96a7d976ae9b",
   "bytes_length": 30290,
   "ordered_record_sha256": "ea285a63e5a4c16a5cfa8622db164edd932dc97046dff455b70ba784b43dcffe",
@@ -33,7 +36,7 @@
     "mid risk": 336,
     "low risk": 406
   },
-  "config_hash": "fcc074a16ac2dedbf36877a363075feb78514d22aa0604df5027689f7e512732",
+  "config_hash": "6c7bab9c0fee0d1f35bc47e32caafafeb238890c17ee74e25c107b3f426f3440",
   "spec": {
     "feature_columns": [
       "Age",
@@ -59,7 +62,8 @@
       "choices": [
         "high",
         "other"
-      ]
+      ],
+      "instructions": "You are classifying a single maternal-health record described only by six routine measurements. Decide whether this record is HIGH risk or not. Answer with exactly one choice: 'high' if it is high risk, or 'other' if it is not high risk (that is, mid or low risk)."
     },
     "stage2": {
       "name": "mid risk rather than low risk?",
@@ -67,12 +71,41 @@
         "mid",
         "low"
       ],
-      "gated_by": "stage1 == other"
+      "gated_by": "stage1 == other",
+      "instructions": "This maternal-health record has already been judged to be NOT high risk. Using only the six routine measurements, decide whether it is mid risk or low risk. Answer with exactly one choice: 'mid' or 'low'."
     },
     "label_mapping": {
       "high": "high risk",
       "other+mid": "mid risk",
       "other+low": "low risk"
+    },
+    "output_schema": {
+      "choice": "exactly one of the stage's allowed choices",
+      "confidence": "a number in [0, 1]",
+      "probabilities": "a mapping from each allowed choice to a number in [0, 1]"
+    },
+    "feature_serialization": {
+      "order": [
+        "Age",
+        "SystolicBP",
+        "DiastolicBP",
+        "BS",
+        "BodyTemp",
+        "HeartRate"
+      ],
+      "sort_keys": true,
+      "sample": {
+        "Age": 30,
+        "SystolicBP": 120,
+        "DiastolicBP": 80,
+        "BS": 7.5,
+        "BodyTemp": 98.0,
+        "HeartRate": 76
+      }
+    },
+    "effective_prompts": {
+      "stage1": "You are classifying a single maternal-health record described only by six routine measurements. Decide whether this record is HIGH risk or not. Answer with exactly one choice: 'high' if it is high risk, or 'other' if it is not high risk (that is, mid or low risk).\n\nRecord measurements (JSON): {\"Age\": 30, \"BS\": 7.5, \"BodyTemp\": 98.0, \"DiastolicBP\": 80, \"HeartRate\": 76, \"SystolicBP\": 120}\n\nRespond with structured JSON. The 'choice' field must be exactly one of ['high', 'other']. Also report 'confidence' (0-1) and 'probabilities', a mapping from each of ['high', 'other'] to its probability (0-1).",
+      "stage2": "This maternal-health record has already been judged to be NOT high risk. Using only the six routine measurements, decide whether it is mid risk or low risk. Answer with exactly one choice: 'mid' or 'low'.\n\nRecord measurements (JSON): {\"Age\": 30, \"BS\": 7.5, \"BodyTemp\": 98.0, \"DiastolicBP\": 80, \"HeartRate\": 76, \"SystolicBP\": 120}\n\nRespond with structured JSON. The 'choice' field must be exactly one of ['mid', 'low']. Also report 'confidence' (0-1) and 'probabilities', a mapping from each of ['mid', 'low'] to its probability (0-1)."
     }
   }
 }
