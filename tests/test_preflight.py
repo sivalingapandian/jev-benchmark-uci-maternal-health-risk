@@ -5,7 +5,11 @@ replace the live three-provider preflight that VAL-FLOW-001 requires; that is a
 real paid CLI run.
 """
 
+import pytest
+
 from jev_benchmark import spec, workflow
+from jev_benchmark.budget import BudgetLedger
+from jev_benchmark.cli import _charge_preflight
 from jev_benchmark.errors import InvalidDecisionError
 from jev_benchmark.preflight import run_preflight, run_preflight_from_env
 from jev_benchmark.providers.base import ProviderAdapter, StageDecision, Usage
@@ -95,6 +99,53 @@ def test_preflight_fails_when_usage_is_missing():
     jev = next(p for p in result.providers if p.requested_model == "jev-1.13.0")
     assert jev.ok is False
     assert jev.outcome == workflow.PREDICTED  # it predicted, but usage was unknown
+
+
+def test_usage_totals_keep_missing_tokens_unknown_not_zero():
+    # Missing token counts must stay None in the redacted totals: laundering
+    # them into 0 would let the budget charge such an attempt at a $0.00
+    # estimate instead of retaining its reservation as unknown.
+    no_usage = StageDecision(
+        stage="stage1",
+        requested_model="jev-1.13.0",
+        actual_model="jev-1.13.0",
+        choice="high",
+        confidence=0.8,
+        probabilities=None,
+        usage=Usage(),
+    )
+    adapters = _all_ok_adapters()
+    adapters[0] = ScriptedAdapter("jev-1.13.0", {"stage1": no_usage})
+    result = run_preflight(adapters)
+    jev = next(p for p in result.providers if p.requested_model == "jev-1.13.0")
+    assert jev.usage_totals["input_tokens"] is None
+    assert jev.usage_totals["output_tokens"] is None
+
+
+def test_preflight_charge_retains_unknown_when_jev_usage_is_missing():
+    # Path: the CLI preflight charge. A Jev preflight that returned a label but
+    # no usage keeps its reservation as unknown in the shared ledger; it is
+    # never settled at a $0.00 token estimate. The other providers' known usage
+    # still settles to their own bases.
+    no_usage = StageDecision(
+        stage="stage1",
+        requested_model="jev-1.13.0",
+        actual_model="jev-1.13.0",
+        choice="high",
+        confidence=0.8,
+        probabilities=None,
+        usage=Usage(),
+    )
+    adapters = _all_ok_adapters()
+    adapters[0] = ScriptedAdapter("jev-1.13.0", {"stage1": no_usage})
+    result = run_preflight(adapters)
+
+    ledger = BudgetLedger()
+    _charge_preflight(ledger, result)
+    assert ledger.estimated_jev == 0.0
+    assert ledger.reserved_unknown == pytest.approx(ledger.pricing.per_attempt_reservation)
+    assert ledger.billed_openrouter > 0.0  # known OpenRouter usage still bills
+    assert ledger.exposure > ledger.planning_seed
 
 
 def test_preflight_fails_when_a_model_is_missing():

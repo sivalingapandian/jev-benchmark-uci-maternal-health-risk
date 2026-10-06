@@ -69,9 +69,31 @@ def test_malformed_probabilities_fail_when_explicitly_required():
         )
 
 
-def test_confidence_out_of_range_becomes_none():
+def test_confidence_out_of_range_is_none_when_not_required():
+    # Only a context whose request schema leaves confidence optional keeps the
+    # coerced-None behaviour (mirroring optional probabilities). The OpenRouter
+    # strict schema declares confidence required, so its parser rejects instead.
     _, conf, _ = validate_choice_response("high", ("high", "other"), confidence=5.0)
     assert conf is None
+
+
+def test_confidence_out_of_range_fails_when_explicitly_required():
+    with pytest.raises(InvalidDecisionError):
+        validate_choice_response(
+            "high", ("high", "other"), confidence=5.0, require_confidence=True
+        )
+
+
+def test_confidence_missing_fails_when_explicitly_required():
+    with pytest.raises(InvalidDecisionError):
+        validate_choice_response("high", ("high", "other"), require_confidence=True)
+
+
+def test_confidence_malformed_fails_when_explicitly_required():
+    with pytest.raises(InvalidDecisionError):
+        validate_choice_response(
+            "high", ("high", "other"), confidence="high", require_confidence=True
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -81,7 +103,7 @@ class FakeJevClient:
     def __init__(self, answers, *, model="jev-1.13.0", usage=(10, 2), raise_exc=None):
         self._answers = answers
         self._model = model
-        self._usage = usage
+        self._usage = usage  # None => response carries no usage block at all
         self._raise_exc = raise_exc
         self.calls = []
 
@@ -92,7 +114,13 @@ class FakeJevClient:
             raise self._raise_exc
         choice, conf, probs = self._answers[stage_id]
         answer = SimpleNamespace(choice=choice, confidence=conf, probabilities=probs)
-        usage = SimpleNamespace(input_tokens=self._usage[0], output_tokens=self._usage[1])
+        usage = (
+            None
+            if self._usage is None
+            else SimpleNamespace(
+                input_tokens=self._usage[0], output_tokens=self._usage[1]
+            )
+        )
         return SimpleNamespace(model=self._model, usage=usage, answers={stage_id: answer})
 
 
@@ -141,6 +169,32 @@ def test_jev_maps_sdk_error_to_request_error():
     adapter = JevAdapter(client=client, model_id="jev-1.13.0")
     with pytest.raises(ProviderRequestError):
         adapter.decide(spec.STAGE1, STATE)
+
+
+def test_jev_sdk_validation_error_is_invalid_without_usage():
+    # The SDK-validation failure path raises InvalidDecisionError carrying no
+    # usage, so this attempt's cost basis is unknown; the budget must retain
+    # its reservation rather than settle a $0.00 token estimate.
+    import httpx
+    import typesafe_sdk as ts
+
+    exc = ts.TypeSafeAPIResponseValidationError(422, {}, httpx.Headers(), "answers")
+    client = FakeJevClient({}, raise_exc=exc)
+    adapter = JevAdapter(client=client, model_id="jev-1.13.0")
+    with pytest.raises(InvalidDecisionError) as excinfo:
+        adapter.decide(spec.STAGE1, STATE)
+    assert excinfo.value.usage is None
+
+
+def test_jev_success_without_usage_block_reports_unknown_usage():
+    # A successful response with no usage block yields unknown (None) token
+    # counts; the decision stays valid, but its cost basis is unknown.
+    client = FakeJevClient({"stage1": ("high", 0.9, {"high": 0.9, "other": 0.1})}, usage=None)
+    adapter = JevAdapter(client=client, model_id="jev-1.13.0")
+    decision = adapter.decide(spec.STAGE1, STATE)
+    assert decision.choice == "high"
+    assert decision.usage.input_tokens is None
+    assert decision.usage.output_tokens is None
 
 
 # --------------------------------------------------------------------------- #
@@ -239,6 +293,37 @@ def test_openrouter_requires_probabilities_in_structured_output():
     # a complete response that omits them is invalid rather than a usable label.
     payload = json.dumps({"choice": "high", "confidence": 0.9})
     resp = _make_openrouter_response(content=payload)  # finish_reason="stop"
+    adapter = OpenRouterAdapter("openai/gpt-4o-mini", client=FakeOpenRouterClient(resp))
+    with pytest.raises(InvalidDecisionError):
+        adapter.decide(spec.STAGE1, STATE)
+
+
+def test_openrouter_requires_confidence_in_structured_output():
+    # The structured schema also marks confidence required; the parser agrees,
+    # so a schema-violating response is an invalid outcome rather than a
+    # silently scored label with confidence=None.
+    payload = json.dumps({"choice": "high", "probabilities": {"high": 0.9, "other": 0.1}})
+    resp = _make_openrouter_response(content=payload)
+    adapter = OpenRouterAdapter("openai/gpt-4o-mini", client=FakeOpenRouterClient(resp))
+    with pytest.raises(InvalidDecisionError):
+        adapter.decide(spec.STAGE1, STATE)
+
+
+def test_openrouter_out_of_range_confidence_is_invalid():
+    payload = json.dumps(
+        {"choice": "high", "confidence": 1.5, "probabilities": {"high": 0.9, "other": 0.1}}
+    )
+    resp = _make_openrouter_response(content=payload)
+    adapter = OpenRouterAdapter("openai/gpt-4o-mini", client=FakeOpenRouterClient(resp))
+    with pytest.raises(InvalidDecisionError):
+        adapter.decide(spec.STAGE1, STATE)
+
+
+def test_openrouter_malformed_confidence_is_invalid():
+    payload = json.dumps(
+        {"choice": "high", "confidence": "high", "probabilities": {"high": 0.9, "other": 0.1}}
+    )
+    resp = _make_openrouter_response(content=payload)
     adapter = OpenRouterAdapter("openai/gpt-4o-mini", client=FakeOpenRouterClient(resp))
     with pytest.raises(InvalidDecisionError):
         adapter.decide(spec.STAGE1, STATE)

@@ -80,8 +80,23 @@ class PreflightResult:
 
 
 def _sum_usage(usages: list[Usage]) -> dict:
-    input_tokens = sum(u.input_tokens or 0 for u in usages)
-    output_tokens = sum(u.output_tokens or 0 for u in usages)
+    """Aggregate per-stage usage into redacted totals.
+
+    A token count is ``None`` unless *every* recorded stage reported it:
+    missing counts must stay unknown rather than being laundered into ``0``,
+    because the preflight charge settles unknown usage as retained-unknown
+    exposure instead of a ``$0.00`` estimate.
+    """
+    input_tokens = (
+        sum(u.input_tokens for u in usages)
+        if usages and all(u.input_tokens is not None for u in usages)
+        else None
+    )
+    output_tokens = (
+        sum(u.output_tokens for u in usages)
+        if usages and all(u.output_tokens is not None for u in usages)
+        else None
+    )
     costs = [u.cost for u in usages if u.cost is not None]
     return {
         "input_tokens": input_tokens,

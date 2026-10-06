@@ -176,16 +176,17 @@ class OpenRouterAdapter(ProviderAdapter):
             )
 
         try:
-            # The structured schema marks ``probabilities`` required, so the
-            # local parser requires them too: the schema and parser agree, and a
-            # response missing/malforming required output is an invalid outcome
-            # rather than a usable label.
+            # The structured schema marks ``confidence`` and ``probabilities``
+            # required, so the local parser requires them too: the schema and
+            # parser agree, and a response missing/malforming a required field
+            # is an invalid outcome rather than a silently scored label.
             choice, confidence, probabilities = validate_choice_response(
                 payload.get("choice"),
                 stage["choices"],
                 confidence=payload.get("confidence"),
                 probabilities=payload.get("probabilities"),
                 require_probabilities=True,
+                require_confidence=True,
             )
         except InvalidDecisionError as exc:
             exc.usage = usage

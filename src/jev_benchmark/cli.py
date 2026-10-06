@@ -309,8 +309,9 @@ def _charge_preflight(ledger, result) -> None:
 
     Each provider's aggregate usage is reserved then settled: OpenRouter to its
     billed cost when reported (else retained-unknown), Jev to a published-rate
-    token estimate. A near-cap refusal would raise, which is acceptable because
-    preflight must not proceed past the shared guard either.
+    token estimate when its token counts are complete (else retained-unknown,
+    never a $0.00 estimate). A near-cap refusal would raise, which is
+    acceptable because preflight must not proceed past the shared guard either.
     """
     for provider in result.providers:
         totals = provider.usage_totals

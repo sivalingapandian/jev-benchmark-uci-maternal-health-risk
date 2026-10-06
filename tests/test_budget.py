@@ -60,6 +60,48 @@ def test_openrouter_without_cost_is_retained_as_unknown():
     assert ledger.reserved_unknown > 0.0
 
 
+def test_jev_settle_without_usage_is_retained_as_unknown():
+    # A Jev attempt whose usage never arrived cannot be priced: its reservation
+    # is retained as unknown billable exposure, never booked at a $0.00
+    # estimate (mirroring the OpenRouter missing-cost retention).
+    ledger = BudgetLedger()
+    token = ledger.reserve()
+    settlement = ledger.settle_estimated(token, None)
+    assert settlement.basis == RESERVED_UNKNOWN
+    assert settlement.amount == pytest.approx(ledger.pricing.per_attempt_reservation)
+    assert ledger.estimated_jev == 0.0
+    assert ledger.reserved_unknown == pytest.approx(ledger.pricing.per_attempt_reservation)
+    # The attempt is not assumed free: exposure stays above the seed.
+    assert ledger.exposure > PLANNING_SEED_USD
+
+
+def test_jev_settle_with_missing_token_counts_is_retained_as_unknown():
+    # Either missing count (input or output) makes the token-rate price basis
+    # unknown, so the reservation is retained rather than settled at $0.
+    ledger = BudgetLedger()
+    for usage in (
+        Usage(),  # no usage block at all
+        Usage(input_tokens=5),  # output token count missing
+        Usage(output_tokens=5),  # input token count missing
+    ):
+        token = ledger.reserve()
+        settlement = ledger.settle_estimated(token, usage)
+        assert settlement.basis == RESERVED_UNKNOWN
+    assert ledger.estimated_jev == 0.0
+    assert ledger.reserved_unknown == pytest.approx(3 * ledger.pricing.per_attempt_reservation)
+
+
+def test_jev_settle_with_complete_token_counts_is_estimated():
+    # Present counts price normally even when the output count is zero: the
+    # price basis is fully known, so the reservation settles to the estimate.
+    ledger = BudgetLedger()
+    token = ledger.reserve()
+    settlement = ledger.settle_estimated(token, Usage(input_tokens=1_000, output_tokens=0))
+    assert settlement.basis == ESTIMATED
+    assert ledger.estimated_jev == pytest.approx(1_000 * 0.042 / 1_000_000)
+    assert ledger.reserved_unknown == 0.0
+
+
 def test_reserve_refused_before_reaching_cap():
     pricing = Pricing(per_attempt_reservation=1.0)
     ledger = BudgetLedger(cap=5.0, pricing=pricing, planning_seed=0.0)

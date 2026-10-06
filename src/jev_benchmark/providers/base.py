@@ -126,25 +126,31 @@ def validate_choice_response(
     confidence: object = None,
     probabilities: object = None,
     require_probabilities: bool = False,
+    require_confidence: bool = False,
 ) -> tuple[str, float | None, dict[str, float] | None]:
     """Validate a decision payload against a stage's allowed choices.
 
     The ``choice`` is always mandatory and must be one of ``allowed``. Confidence
     and probabilities are recorded when well-formed. They are treated as optional
-    for label selection unless ``require_probabilities`` is set, which lets a
-    caller that genuinely needs probabilities turn a missing/invalid block into an
-    invalid outcome rather than silently accepting it.
+    for label selection unless ``require_probabilities`` / ``require_confidence``
+    is set, which lets a caller whose outbound schema declares a field required
+    turn a missing, malformed, or out-of-range value into an invalid outcome
+    rather than silently accepting a schema-violating response.
     """
     if not isinstance(raw_choice, str) or raw_choice not in allowed:
         raise InvalidDecisionError(
             f"choice {raw_choice!r} is not one of the allowed choices {list(allowed)}"
+        )
+    conf = _coerce_confidence(confidence)
+    if require_confidence and conf is None:
+        raise InvalidDecisionError(
+            "required confidence is missing, malformed, or outside [0, 1]"
         )
     probs = _coerce_probabilities(probabilities, allowed)
     if require_probabilities and probs is None:
         raise InvalidDecisionError(
             "required probabilities are missing or not well-formed for all choices"
         )
-    conf = _coerce_confidence(confidence)
     return raw_choice, conf, probs
 
 

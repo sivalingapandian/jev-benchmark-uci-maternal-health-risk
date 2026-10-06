@@ -13,8 +13,9 @@ with amounts that are simply unknown:
 * ``estimated_jev`` - Jev spend estimated from token counts at a published
   rate, because Jev exposes tokens but no billed-dollar field.
 * ``reserved_unknown`` - worst-case reservations retained for attempts whose
-  billable amount is unknown (timeouts, transport failures, or a missing cost
-  field). These are never assumed free.
+  billable amount is unknown (timeouts, transport failures, a missing
+  OpenRouter cost, or Jev usage/token counts that were never reported). These
+  are never assumed free.
 
 A fixed ``$0.10`` planning-readiness seed accounts for the three real
 readiness calls already made during planning (OpenRouter reported
@@ -80,7 +81,13 @@ class Pricing:
     per_attempt_reservation: float = PER_ATTEMPT_RESERVATION_USD
 
     def jev_estimate(self, usage: Usage | None) -> float:
-        """Published-token-rate estimate for one Jev attempt (never a billed cost)."""
+        """Published-token-rate estimate for one Jev attempt (never a billed cost).
+
+        A usage block with missing token counts has no price basis at all: the
+        caller must retain the attempt as unknown exposure rather than treat a
+        ``$0`` result from here as a real estimate (see
+        :meth:`BudgetLedger.settle_estimated`).
+        """
         if usage is None:
             return 0.0
         return (usage.input_tokens or 0) * self.jev_input_rate + (
@@ -215,7 +222,16 @@ class BudgetLedger:
         return Settlement(BILLED, cost)
 
     def settle_estimated(self, token: int, usage: Usage | None) -> Settlement:
-        """Settle a Jev attempt to a published-token-rate estimate."""
+        """Settle a Jev attempt to a published-token-rate estimate.
+
+        Token counts are Jev's only cost basis (it exposes no billed-dollar
+        field), so an attempt whose usage block or input/output token counts
+        never arrived cannot be priced. Its reservation is retained as unknown
+        billable exposure rather than assumed free, mirroring the OpenRouter
+        missing-cost retention in :meth:`settle_openrouter`.
+        """
+        if usage is None or usage.input_tokens is None or usage.output_tokens is None:
+            return self.settle_unknown(token)
         self._pop(token)
         estimate = self.pricing.jev_estimate(usage)
         self.estimated_jev += estimate

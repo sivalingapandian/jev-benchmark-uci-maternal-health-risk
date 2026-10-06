@@ -6,17 +6,19 @@ pilot CLI, which exercises the real three-provider dispatch.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from jev_benchmark import runner, spec, workflow
-from jev_benchmark.budget import BudgetLedger, Pricing, open_shared_budget
+from jev_benchmark.budget import RESERVED_UNKNOWN, BudgetLedger, Pricing, open_shared_budget
 from jev_benchmark.errors import (
     InvalidDecisionError,
     ProviderRequestError,
     RunDirectoryError,
     RunIdentityError,
 )
+from jev_benchmark.providers import JevAdapter
 from jev_benchmark.providers.base import ProviderAdapter, StageDecision, Usage
 
 MODEL_IDS = list(spec.MODEL_IDS)
@@ -151,6 +153,67 @@ def test_measured_adapter_records_monotonic_duration():
     attempt = measured.attempts[0]
     assert attempt.duration is not None
     assert attempt.duration >= 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Jev missing-usage settlement: reservations are retained, never $0
+# --------------------------------------------------------------------------- #
+class FakeJevClient:
+    """Minimal Jev SDK stand-in: raises, or answers (optionally without usage)."""
+
+    def __init__(self, *, raise_exc=None, usage=(10, 2)):
+        self._raise_exc = raise_exc
+        self._usage = usage  # None => response carries no usage block
+
+    def system_one(self, state, questions, model=None):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        ((stage_id, _question),) = questions.items()
+        answer = SimpleNamespace(choice="high", confidence=0.9, probabilities=None)
+        usage = (
+            None
+            if self._usage is None
+            else SimpleNamespace(input_tokens=self._usage[0], output_tokens=self._usage[1])
+        )
+        return SimpleNamespace(model=model, usage=usage, answers={stage_id: answer})
+
+
+def test_jev_sdk_validation_error_keeps_reservation_unknown():
+    # Path: the Jev SDK-validation error. The adapter raises InvalidDecisionError
+    # with no usage, so the attempt's cost is unknown; its conservative
+    # reservation must be retained as unknown, never settled at a $0.00 estimate.
+    import httpx
+    import typesafe_sdk as ts
+
+    exc = ts.TypeSafeAPIResponseValidationError(422, {}, httpx.Headers(), "answers")
+    adapter = JevAdapter(client=FakeJevClient(raise_exc=exc), model_id="jev-1.13.0")
+    ledger = BudgetLedger()
+    measured = runner.MeasuredAdapter(adapter, ledger, max_retries=0)
+    with pytest.raises(InvalidDecisionError):
+        measured.decide(spec.STAGE1, STATE)
+    assert ledger.reserved_unknown == pytest.approx(ledger.pricing.per_attempt_reservation)
+    assert ledger.estimated_jev == 0.0
+    (attempt,) = measured.attempts
+    assert attempt.status == "invalid"
+    assert attempt.cost_basis == RESERVED_UNKNOWN
+
+
+def test_jev_success_without_usage_keeps_reservation_unknown():
+    # Path: a Jev success response with no usage block. The decision is valid,
+    # but its token-rate price basis is unknown, so the reservation stays
+    # retained as unknown instead of being released at a $0.00 estimate.
+    adapter = JevAdapter(client=FakeJevClient(usage=None), model_id="jev-1.13.0")
+    ledger = BudgetLedger()
+    measured = runner.MeasuredAdapter(adapter, ledger, max_retries=0)
+    decision = measured.decide(spec.STAGE1, STATE)
+    assert decision.choice == "high"
+    assert ledger.reserved_unknown == pytest.approx(ledger.pricing.per_attempt_reservation)
+    assert ledger.estimated_jev == 0.0
+    (attempt,) = measured.attempts
+    assert attempt.status == "ok"
+    assert attempt.cost_basis == RESERVED_UNKNOWN
+    assert attempt.input_tokens is None
+    assert attempt.output_tokens is None
 
 
 # --------------------------------------------------------------------------- #
