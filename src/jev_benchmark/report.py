@@ -718,7 +718,7 @@ def print_report(report: dict) -> None:
     )
     print(
         f"  total run time               : {run['total_run_seconds']:.1f}s "
-        "(cumulative active dispatch; excludes any wall-clock gap between segments)"
+        "(cumulative active dispatch; monotonic client clock, idle time excluded)"
     )
     print()
 

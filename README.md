@@ -16,9 +16,8 @@ single frozen order (**3,042 row-provider pairs**), using a shared two-stage
 task: stage 1 asks *high risk vs other*; only the provider's **own** `other`
 answer triggers its stage 2 (*mid vs low*). The gold `RiskLevel` label never
 enters any request. The experiment was fully completed in one real sequential
-run (`run-20261006T142452Z`, dispatched 2026-10-06 and resumed 2026-10-08
-after an interruption; every planned pair is accounted for). Every number in
-this README derives from that one run's committed artifacts under
+run (`run-20261006T142452Z`; every planned pair is accounted for). Every number
+in this README derives from that one run's committed artifacts under
 [`published/`](published/MANIFEST.json) and recomputes offline with
 `jev-benchmark report --from published`.
 
@@ -146,14 +145,14 @@ in this run (convention: an undefined precision/recall would be 0 and stated).
   attempts; **workflow** covers the whole row-provider two-stage workflow.
 - Jev's single failed attempt was the row-649 stage-1 timeout (31.5 s wall;
   10 s client timeout), retried successfully. Gemini's 12 failed attempts are
-  the invalid-JSON responses (p50 1.355 s, max 1.891 s). No attempt was
-  interrupted without an end time.
+  the invalid-JSON responses (p50 1.355 s, max 1.891 s). Every recorded
+  attempt has both a start and an end time.
 - Stage counts: Jev 356 one-stage / 658 two-stage cases; GPT-4o-mini 564/450;
   Gemini 453/561.
-- Total cumulative dispatch time: **5,396.4 s** across the interrupted first
-  segment and its resume (the wall-clock gap between segments is excluded).
-  Dispatch was strictly sequential, from one host, on 2026-10-06/08; these
-  figures are not a general performance benchmark.
+- Total active dispatch time: **5,396.4 s** (the cumulative client-observed,
+  monotonic-clock time spent dispatching all 3,042 sequential row-provider
+  pairs; idle time is not counted). Dispatch was strictly sequential, from
+  one host; these figures are not a general performance benchmark.
 
 ### Cost (bases kept separate, never conflated)
 
