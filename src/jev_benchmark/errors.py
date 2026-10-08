@@ -102,3 +102,14 @@ class HistoricalExposureError(BenchmarkError):
     Rather than guess, the shared budget refuses to initialise so the operator
     can reconcile the historical spend before any further paid calls.
     """
+
+
+class ReportInputError(BenchmarkError):
+    """A report cannot be built from the given artifacts.
+
+    Raised for a missing or empty run directory, a run that is not complete
+    (partial results must never be presented as the completed benchmark),
+    a run whose dataset or frozen-task identity does not match the local data,
+    or records that cannot be scored (e.g. unknown gold labels). The message
+    states exactly what is missing so the reader can fix it offline.
+    """

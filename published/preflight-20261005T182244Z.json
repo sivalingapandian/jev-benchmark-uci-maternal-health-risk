@@ -1,0 +1,162 @@
+{
+  "config_hash": "fcc074a16ac2dedbf36877a363075feb78514d22aa0604df5027689f7e512732",
+  "ok": true,
+  "providers": [
+    {
+      "requested_model": "jev-1.13.0",
+      "ok": true,
+      "outcome": "predicted",
+      "actual_model": "jev-1.13.0",
+      "final_label": "low risk",
+      "stage_count": 2,
+      "stages": [
+        {
+          "stage": "stage1",
+          "requested_model": "jev-1.13.0",
+          "actual_model": "jev-1.13.0",
+          "status": "ok",
+          "choice": "other",
+          "confidence": 0.96,
+          "probabilities": {
+            "high": 0.02,
+            "other": 0.98
+          },
+          "usage": {
+            "input_tokens": 399,
+            "output_tokens": 32,
+            "cost": null
+          },
+          "detail": null
+        },
+        {
+          "stage": "stage2",
+          "requested_model": "jev-1.13.0",
+          "actual_model": "jev-1.13.0",
+          "status": "ok",
+          "choice": "low",
+          "confidence": 0.67,
+          "probabilities": {
+            "mid": 0.16,
+            "low": 0.84
+          },
+          "usage": {
+            "input_tokens": 382,
+            "output_tokens": 32,
+            "cost": null
+          },
+          "detail": null
+        }
+      ],
+      "usage_totals": {
+        "input_tokens": 781,
+        "output_tokens": 64,
+        "cost": null
+      },
+      "detail": null
+    },
+    {
+      "requested_model": "openai/gpt-4o-mini",
+      "ok": true,
+      "outcome": "predicted",
+      "actual_model": "openai/gpt-4o-mini",
+      "final_label": "low risk",
+      "stage_count": 2,
+      "stages": [
+        {
+          "stage": "stage1",
+          "requested_model": "openai/gpt-4o-mini",
+          "actual_model": "openai/gpt-4o-mini",
+          "status": "ok",
+          "choice": "other",
+          "confidence": 0.85,
+          "probabilities": {
+            "high": 0.15,
+            "other": 0.85
+          },
+          "usage": {
+            "input_tokens": 272,
+            "output_tokens": 26,
+            "cost": 5.64e-05
+          },
+          "detail": null
+        },
+        {
+          "stage": "stage2",
+          "requested_model": "openai/gpt-4o-mini",
+          "actual_model": "openai/gpt-4o-mini",
+          "status": "ok",
+          "choice": "low",
+          "confidence": 0.85,
+          "probabilities": {
+            "mid": 0.15,
+            "low": 0.85
+          },
+          "usage": {
+            "input_tokens": 256,
+            "output_tokens": 26,
+            "cost": 5.4e-05
+          },
+          "detail": null
+        }
+      ],
+      "usage_totals": {
+        "input_tokens": 528,
+        "output_tokens": 52,
+        "cost": 0.0001104
+      },
+      "detail": null
+    },
+    {
+      "requested_model": "google/gemini-2.5-flash",
+      "ok": true,
+      "outcome": "predicted",
+      "actual_model": "google/gemini-2.5-flash",
+      "final_label": "low risk",
+      "stage_count": 2,
+      "stages": [
+        {
+          "stage": "stage1",
+          "requested_model": "google/gemini-2.5-flash",
+          "actual_model": "google/gemini-2.5-flash",
+          "status": "ok",
+          "choice": "other",
+          "confidence": 0.95,
+          "probabilities": {
+            "high": 0.05,
+            "other": 0.95
+          },
+          "usage": {
+            "input_tokens": 200,
+            "output_tokens": 52,
+            "cost": 0.00019
+          },
+          "detail": null
+        },
+        {
+          "stage": "stage2",
+          "requested_model": "google/gemini-2.5-flash",
+          "actual_model": "google/gemini-2.5-flash",
+          "status": "ok",
+          "choice": "low",
+          "confidence": 0.95,
+          "probabilities": {
+            "mid": 0.05,
+            "low": 0.95
+          },
+          "usage": {
+            "input_tokens": 185,
+            "output_tokens": 35,
+            "cost": 0.000143
+          },
+          "detail": null
+        }
+      ],
+      "usage_totals": {
+        "input_tokens": 385,
+        "output_tokens": 87,
+        "cost": 0.000333
+      },
+      "detail": null
+    }
+  ]
+}

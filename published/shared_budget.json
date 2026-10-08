@@ -1,0 +1,15 @@
+{
+  "cap": 20.0,
+  "pricing": {
+    "jev_input_rate": 4.2000000000000006e-08,
+    "jev_output_rate": 4.2000000000000006e-08,
+    "per_attempt_reservation": 0.005
+  },
+  "planning_seed": 0.1,
+  "billed_openrouter": 0.3493505000000076,
+  "estimated_jev": 0.029914038000000028,
+  "reserved_unknown": 0.011316475999999999,
+  "pending": [],
+  "exposure": 0.4905810140000077,
+  "remaining": 19.509418985999993
+}

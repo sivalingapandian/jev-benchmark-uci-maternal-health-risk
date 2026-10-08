@@ -1,0 +1,35 @@
+{
+  "description": "Sanitized, non-secret completed-run artifacts of the one real measured experiment (run-20261006T142452Z, 1014 rows x 3 providers = 3042 row-provider pairs). These are byte-exact copies of the local gitignored run directory; they contain no API keys, authorization headers, or raw provider payloads, and let a fresh clone reproduce every published README metric and execute the offline notebook without any credentials.",
+  "run_id": "run-20261006T142452Z",
+  "config_hash": "6c7bab9c0fee0d1f35bc47e32caafafeb238890c17ee74e25c107b3f426f3440",
+  "ordered_record_sha256": "ea285a63e5a4c16a5cfa8622db164edd932dc97046dff455b70ba784b43dcffe",
+  "files": {
+    "run.json": {
+      "bytes": 10079,
+      "sha256": "31d220a9f06973db87593927501ed29d20af33714dd999418100955768a0de7e"
+    },
+    "cases.jsonl": {
+      "bytes": 2675465,
+      "sha256": "8715861ae8b20519f382a6b2dfac47fd3d29e0923cf7a882949252fe8ddc864e"
+    },
+    "stages.jsonl": {
+      "bytes": 3326813,
+      "sha256": "12d87866dd34c993db121606d93c4b971e308b35aafd3ba6e2ef1a7d7daf9100"
+    },
+    "shared_budget.json": {
+      "bytes": 406,
+      "sha256": "9be65c4d1cebada731f7ac99aa58b3a6ee5a9bda8041be1a716686727a3d3f0d"
+    },
+    "preflight-20261005T182244Z.json": {
+      "bytes": 4085,
+      "sha256": "5bf13beb6e568746ae9b97bb0940c882778617153d51bee89b605b0820d89807"
+    }
+  },
+  "provenance_notes": {
+    "run.json": "durable run header: identity, planned population, status, budget snapshot",
+    "cases.jsonl": "one terminal record per (row, provider): outcome, final vs gold label, per-attempt status/timing/usage/cost basis",
+    "stages.jsonl": "one entry per successful stage: validated choice, self-reported confidence/probabilities, usage",
+    "shared_budget.json": "final cumulative cross-phase $20 guard state (planning seed + preflight + pilots + measured runs); snapshot only",
+    "preflight-20261005T182244Z.json": "pre-repair planning preflight record kept for cost reconciliation only; it predates the durable shared-ledger format and the current frozen task wording (config fcc074a1...), so it is cost evidence, not run evidence"
+  }
+}

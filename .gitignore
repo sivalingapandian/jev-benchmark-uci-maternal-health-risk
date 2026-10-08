@@ -12,3 +12,4 @@ dist/
 runs/
 outputs/
 results/
+.DS_Store

@@ -24,6 +24,13 @@ Subcommands available in this milestone:
 * ``run-inspect`` - offline summary of a saved run/pilot directory: outcome
   counts, conservative accounting, latency p50/p95 at both scopes, and whether
   the run is complete (no paid requests).
+
+* ``report`` - offline metrics report from a completed run's durable artifacts
+  (the committed ``published/`` directory or a local run directory): coverage,
+  all-attempted and success-only metrics, the 3x4 confusion with an explicit
+  invalid column, latency, cost bases, uncertainty and duplicate sensitivity.
+  Verifies the run's dataset/frozen-task identity against the local data. No
+  keys, no paid requests.
 """
 
 from __future__ import annotations
@@ -36,6 +43,7 @@ import sys
 from pathlib import Path
 
 from . import pilot as pilot_mod
+from . import report as report_mod
 from . import runinspect, runner, spec
 from .budget import CAP_USD, open_shared_budget, validate_cap
 from .dataset import PreparedDataset, prepare_dataset, save_prepared
@@ -44,6 +52,7 @@ from .errors import (
     BudgetConfigError,
     HistoricalExposureError,
     ProviderRequestError,
+    ReportInputError,
     RunDirectoryError,
     RunIdentityError,
     SourceError,
@@ -660,6 +669,37 @@ def _fmt(value: float | None) -> str:
     return f"{value:.4f}" if value is not None else "n/a"
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    """Offline report from a completed run's artifacts; never a paid request."""
+    try:
+        artifacts = report_mod.load_run_artifacts(args.from_dir)
+    except ReportInputError as exc:
+        print(f"report blocked: {exc}", file=sys.stderr)
+        return 1
+    try:
+        dataset = _load_dataset_offline(args)
+    except SourceError as exc:
+        print(f"report blocked: {exc}", file=sys.stderr)
+        return 1
+    try:
+        report_mod.verify_identity(artifacts, dataset)
+    except ReportInputError as exc:
+        print(f"report blocked: {exc}", file=sys.stderr)
+        return 1
+
+    report = report_mod.build_report(
+        artifacts, dataset, n_boot=args.n_boot, seed=args.seed
+    )
+    report_mod.print_report(report)
+
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        print(f"\nreport JSON written to {out_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jev-benchmark",
@@ -824,6 +864,52 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-dir", required=True, help="Run directory to inspect."
     )
     p_run_inspect.set_defaults(func=cmd_run_inspect)
+
+    p_report = sub.add_parser(
+        "report",
+        help="Offline metrics report from a completed run's artifacts (no paid requests).",
+        description="Derive the published comparison from a completed run's durable, "
+        "non-secret artifacts: all-attempted and success-only metrics, the 3x4 confusion "
+        "with an explicit invalid column, latency at API-attempt and workflow scopes, "
+        "billed vs rate-estimated vs unknown cost, bootstrap intervals, McNemar paired "
+        "tests and duplicate-feature sensitivity. Verifies the run's dataset and "
+        "frozen-task identity against the locally prepared data. No keys are read and "
+        "no paid request is made.",
+    )
+    p_report.add_argument(
+        "--from",
+        dest="from_dir",
+        required=True,
+        help="Completed-run artifact directory (e.g. published/ or runs/full).",
+    )
+    p_report.add_argument(
+        "--data-dir",
+        default="data",
+        help="Prepared-data directory whose raw CSV is identity-checked (default: data).",
+    )
+    p_report.add_argument(
+        "--source",
+        default=None,
+        help="CSV path to prepare from if no cached CSV under --data-dir.",
+    )
+    p_report.add_argument(
+        "--n-boot",
+        type=int,
+        default=10_000,
+        help="Bootstrap resamples for the 95% intervals (default: 10000).",
+    )
+    p_report.add_argument(
+        "--seed",
+        type=int,
+        default=20261006,
+        help="Bootstrap seed; fixed so published intervals are reproducible (default: 20261006).",
+    )
+    p_report.add_argument(
+        "--out",
+        default=None,
+        help="Optional path to also write the full report as JSON.",
+    )
+    p_report.set_defaults(func=cmd_report)
 
     return parser
 
