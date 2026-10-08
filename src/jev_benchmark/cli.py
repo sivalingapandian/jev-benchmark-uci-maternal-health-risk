@@ -31,6 +31,11 @@ Subcommands available in this milestone:
   invalid column, latency, cost bases, uncertainty and duplicate sensitivity.
   Verifies the run's dataset/frozen-task identity against the local data. No
   keys, no paid requests.
+
+* ``figures`` - offline regeneration of the committed deterministic PNGs under
+  ``docs/figures/`` from a completed run's artifacts. The figures reuse the
+  report's numbers, render byte-identically for an unchanged artifact set, and
+  never write into the artifact directory. No keys, no paid requests.
 """
 
 from __future__ import annotations
@@ -707,6 +712,46 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_figures(args: argparse.Namespace) -> int:
+    """Offline regeneration of the committed figures; never a paid request."""
+    from . import figures as figures_mod
+
+    try:
+        artifacts = report_mod.load_run_artifacts(args.from_dir)
+    except ReportInputError as exc:
+        print(f"figures blocked: {exc}", file=sys.stderr)
+        return 1
+    try:
+        dataset = _load_dataset_offline(args)
+    except SourceError as exc:
+        print(f"figures blocked: {exc}", file=sys.stderr)
+        return 1
+    try:
+        report_mod.verify_identity(artifacts, dataset)
+        report_mod.verify_official_scope(artifacts)
+    except ReportInputError as exc:
+        print(f"figures blocked: {exc}", file=sys.stderr)
+        return 1
+
+    out_dir = Path(args.out)
+    artifact_dir = artifacts.dir.resolve()
+    resolved_out = out_dir.resolve()
+    if resolved_out == artifact_dir or artifact_dir in resolved_out.parents:
+        print(
+            f"figures blocked: --out {out_dir} is inside the artifact directory "
+            f"{artifacts.dir}; the pinned published artifacts must stay byte-identical",
+            file=sys.stderr,
+        )
+        return 1
+
+    report = report_mod.build_report(artifacts, dataset)
+    written = figures_mod.write_figures(report, artifacts.cases, out_dir)
+    print(f"figures written from {artifacts.dir} (no keys, no network):")
+    for filename, path in written.items():
+        print(f"  {filename} -> {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jev-benchmark",
@@ -917,6 +962,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to also write the full report as JSON.",
     )
     p_report.set_defaults(func=cmd_report)
+
+    p_figures = sub.add_parser(
+        "figures",
+        help="Offline regeneration of the committed docs/figures PNGs (no paid requests).",
+        description="Render the three deterministic result figures from a completed run's "
+        "committed artifacts: the per-model 3x4 confusion heatmaps (with the explicit "
+        "invalid column), the latency distributions at both the API-attempt and "
+        "whole-row-workflow scopes, and the cost breakdown with billed, rate-estimated "
+        "and reserved-unknown bases kept separate. Values are read from the same report "
+        "the 'report' command prints, so a figure cannot disagree with a table. Output is "
+        "byte-identical for an unchanged artifact set; the artifact directory is never "
+        "written to. No keys are read and no paid request is made.",
+    )
+    p_figures.add_argument(
+        "--from",
+        dest="from_dir",
+        required=True,
+        help="Completed-run artifact directory (e.g. published/).",
+    )
+    p_figures.add_argument(
+        "--out",
+        default="docs/figures",
+        help="Directory to write the PNGs into (default: docs/figures).",
+    )
+    p_figures.add_argument(
+        "--data-dir",
+        default="data",
+        help="Prepared-data directory whose raw CSV is identity-checked (default: data).",
+    )
+    p_figures.add_argument(
+        "--source",
+        default=None,
+        help="CSV path to prepare from if no cached CSV under --data-dir.",
+    )
+    p_figures.set_defaults(func=cmd_figures)
 
     return parser
 
