@@ -289,7 +289,7 @@ comparable. No calibration claim is made.
 | Path | Contents |
 |---|---|
 | `src/jev_benchmark/` | package: dataset prep, frozen spec, providers, runner, budget, metrics, report |
-| `published/` | sanitized, non-secret artifacts of the completed run (`MANIFEST.json` lists files + SHA-256) |
+| `published/` | sanitized, non-secret artifacts of the completed run (`MANIFEST.json` lists files + SHA-256 + byte sizes, verified by the `report` command) |
 | `notebooks/benchmark.ipynb` | executed offline results notebook (reads `published/` only; no network) |
 | `data/raw/maternal_health_risk.csv` | official UCI CSV, committed verbatim (CC BY 4.0) |
 | `data/provenance.json`, `data/audit.json` | source provenance and duplicate audit |
@@ -339,9 +339,13 @@ A fresh clone reproduces every README number from the committed artifacts:
 ```
 
 The report command verifies that the published run's frozen dataset and task
-identities match the committed data and current code, recomputes all metrics
-from `published/cases.jsonl`, and refuses a partial or mismatched run rather
-than reporting it as complete. No credential is read at any point.
+identities match the committed data and current code, checks every file listed
+in `published/MANIFEST.json` against its recorded SHA-256 and byte size,
+recomputes all metrics from `published/cases.jsonl`, and accepts only the
+completed official-population run (mode `run`, 1,014 rows x 3 pinned providers
+= 3,042 pairs) - a partial, mismatched, pilot, or `--rows`-reduced run is
+refused rather than reported as the completed benchmark. No credential is read
+at any point.
 
 ## Running a new live benchmark (your keys, your credits)
 
