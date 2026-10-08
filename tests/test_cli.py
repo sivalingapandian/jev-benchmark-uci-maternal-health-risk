@@ -14,6 +14,20 @@ def test_help_exits_zero(capsys):
     assert "inspect" in out
 
 
+@pytest.mark.parametrize(
+    "sub",
+    ["prepare", "inspect", "preflight", "pilot", "run", "run-inspect", "report"],
+)
+def test_subcommand_help_exits_zero(sub, capsys):
+    # argparse interpolates help strings as %-format templates; a bare '%' (e.g.
+    # '95%' in report --n-boot) used to raise TypeError and exit 1.
+    with pytest.raises(SystemExit) as exc:
+        main([sub, "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert sub in out
+
+
 def test_prepare_writes_artifacts_and_preserves_rows(tmp_path, official_csv, capsys):
     rc = main(["prepare", "--source", str(official_csv), "--data-dir", str(tmp_path)])
     assert rc == 0

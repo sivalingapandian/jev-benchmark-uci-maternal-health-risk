@@ -686,6 +686,13 @@ def cmd_report(args: argparse.Namespace) -> int:
     except ReportInputError as exc:
         print(f"report blocked: {exc}", file=sys.stderr)
         return 1
+    # A reduced or non-'run' artifact set must never be presented as the
+    # completed benchmark over the official 1,014-row population.
+    try:
+        report_mod.verify_official_scope(artifacts)
+    except ReportInputError as exc:
+        print(f"report blocked: {exc}", file=sys.stderr)
+        return 1
 
     report = report_mod.build_report(
         artifacts, dataset, n_boot=args.n_boot, seed=args.seed
@@ -896,7 +903,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-boot",
         type=int,
         default=10_000,
-        help="Bootstrap resamples for the 95% intervals (default: 10000).",
+        help="Bootstrap resamples for the 95%% intervals (default: 10000).",
     )
     p_report.add_argument(
         "--seed",

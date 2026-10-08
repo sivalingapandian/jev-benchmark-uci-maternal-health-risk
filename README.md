@@ -298,7 +298,9 @@ comparable. No calibration claim is made.
 
 ## Setup
 
-Requires **Python 3.12**. From the repository root:
+Requires **Python 3.12**, with a Python 3.12 interpreter available on your
+`PATH` (the commands below invoke it as `python3.12`; substitute your own
+interpreter's path if that name is not present). From the repository root:
 
 ```sh
 python3.12 -m venv .venv

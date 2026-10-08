@@ -16,6 +16,7 @@ mismatched results must never be presented as the completed benchmark.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ class RunArtifacts:
     state: RunState
     cases: list[CaseRecord]
     stage_entries: list[dict] | None
+    manifest: dict | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -46,7 +48,8 @@ def load_run_artifacts(from_dir: str | Path) -> RunArtifacts:
     Refuses, with a clear message, a missing directory, a missing/empty
     ``cases.jsonl``, a non-``complete`` status, duplicate row-provider pairs,
     cases outside the planned population, or cases whose gold labels are not
-    the published classes.
+    the published classes. When the directory carries a ``MANIFEST.json``, its
+    listed file SHA-256 values and byte sizes are also verified.
     """
     run_dir = Path(from_dir)
     run_path = run_dir / "run.json"
@@ -123,7 +126,88 @@ def load_run_artifacts(from_dir: str | Path) -> RunArtifacts:
             if line.strip()
         ]
 
-    return RunArtifacts(dir=run_dir, state=state, cases=cases, stage_entries=stage_entries)
+    manifest = verify_manifest(run_dir, state)
+
+    return RunArtifacts(
+        dir=run_dir,
+        state=state,
+        cases=cases,
+        stage_entries=stage_entries,
+        manifest=manifest,
+    )
+
+
+def verify_manifest(run_dir: Path, state: RunState) -> dict | None:
+    """Verify a ``MANIFEST.json`` artifact set, refusing any mismatch.
+
+    When the directory carries a published ``MANIFEST.json``, every listed file
+    must exist and match its recorded byte size and SHA-256; the manifest's
+    run/config/dataset identity must also agree with ``run.json``. A mismatch
+    means the artifact set was modified or truncated and must not be reported as
+    the completed benchmark. Returns a short verification summary, or ``None``
+    when no manifest is present.
+    """
+    manifest_path = run_dir / "MANIFEST.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReportInputError(
+            f"MANIFEST.json under {run_dir} could not be read as JSON: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise ReportInputError(f"MANIFEST.json under {run_dir} is not a JSON object")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ReportInputError(
+            f"MANIFEST.json under {run_dir} lists no files to verify; "
+            "an unverifiable artifact set cannot be reported"
+        )
+
+    for field, actual in (
+        ("run_id", state.run_id),
+        ("config_hash", state.config_hash),
+        ("ordered_record_sha256", state.ordered_record_sha256),
+    ):
+        declared = manifest.get(field)
+        if declared is not None and declared != actual:
+            raise ReportInputError(
+                f"MANIFEST.json {field} {declared!r} does not match run.json {actual!r}; "
+                "the artifact set is internally inconsistent - refusing"
+            )
+
+    verified: dict[str, dict] = {}
+    for name, meta in files.items():
+        candidate = run_dir / name
+        if not candidate.is_file():
+            raise ReportInputError(
+                f"MANIFEST.json lists {name!r} but it is missing from {run_dir}; "
+                "the artifact set is incomplete - refusing"
+            )
+        raw = candidate.read_bytes()
+        meta = meta if isinstance(meta, dict) else {}
+        expected_bytes = meta.get("bytes")
+        if expected_bytes is not None and len(raw) != expected_bytes:
+            raise ReportInputError(
+                f"artifact {name!r} is {len(raw)} bytes but MANIFEST.json records "
+                f"{expected_bytes}; the artifact set was modified - refusing"
+            )
+        digest = hashlib.sha256(raw).hexdigest()
+        expected_sha = meta.get("sha256")
+        if expected_sha is not None and digest != expected_sha:
+            raise ReportInputError(
+                f"artifact {name!r} sha256 {digest} does not match MANIFEST.json "
+                f"{expected_sha}; the artifact set was modified - refusing"
+            )
+        verified[name] = {"bytes": len(raw), "sha256": digest}
+
+    return {
+        "path": str(manifest_path),
+        "run_id": manifest.get("run_id"),
+        "files_verified": len(verified),
+        "files": verified,
+    }
 
 
 def _as_state(source: RunArtifacts | RunState | str | Path) -> RunState:
@@ -157,6 +241,76 @@ def verify_identity(source: RunArtifacts | RunState | str | Path, dataset: Prepa
             f"{expected['config_hash']}; the saved outcomes belong to a different "
             "task wording/schema and cannot be re-reported under this one"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Official-population scope.
+# --------------------------------------------------------------------------- #
+
+def benchmark_scope(artifacts: RunArtifacts) -> dict:
+    """Describe whether an artifact set is the completed official benchmark.
+
+    A completed benchmark is exactly ``mode == 'run'`` over the full official
+    population: the 1,014 published rows crossed with the three pinned
+    providers (3,042 row-provider pairs). Anything narrower - a pilot, a
+    ``--rows`` subset, or a differently-sized population - is a reduced scope
+    that must never be presented as the completed comparison.
+    """
+    state = artifacts.state
+    planned_rows = len(state.planned_row_indices)
+    official_rows = spec.EXPECTED_ROW_COUNT
+    official_models = list(spec.MODEL_IDS)
+    official_pairs = official_rows * len(official_models)
+    model_ids = list(state.model_ids)
+
+    reasons: list[str] = []
+    if state.mode != "run":
+        reasons.append(f"mode is {state.mode!r}, not 'run'")
+    if planned_rows != official_rows:
+        reasons.append(
+            f"it planned {planned_rows} rows, not the official {official_rows}"
+        )
+    if len(model_ids) != len(official_models) or sorted(model_ids) != sorted(official_models):
+        reasons.append(
+            f"its providers {model_ids} are not exactly the three pinned models "
+            f"{official_models}"
+        )
+
+    return {
+        "mode": state.mode,
+        "is_completed_official_benchmark": not reasons,
+        "official_row_count": official_rows,
+        "official_model_ids": official_models,
+        "official_planned_pairs": official_pairs,
+        "planned_rows": planned_rows,
+        "planned_pairs": state.planned_pairs,
+        "completed_pairs": len({c.key for c in artifacts.cases}),
+        "reason": None if not reasons else "; ".join(reasons),
+    }
+
+
+def verify_official_scope(artifacts: RunArtifacts) -> dict:
+    """Refuse any scope that is not the completed official-population benchmark.
+
+    The report is the offline surface a reader trusts, so it must not present a
+    pilot, a ``--rows`` subset, or a doctored ``planned_pairs`` header as the
+    completed benchmark. A reduced or non-``run`` scope is refused with a clear
+    message pointing at ``run-inspect`` for partial runs.
+    """
+    scope = benchmark_scope(artifacts)
+    if not scope["is_completed_official_benchmark"]:
+        raise ReportInputError(
+            "not the completed official-population benchmark: "
+            f"{scope['reason']}. A completed benchmark report requires mode 'run' "
+            f"covering all {scope['official_row_count']} official rows x "
+            f"{len(scope['official_model_ids'])} pinned providers = "
+            f"{scope['official_planned_pairs']} row-provider pairs, but this set has "
+            f"{scope['planned_rows']} rows x {len(artifacts.state.model_ids)} providers "
+            f"= {scope['planned_pairs']} pairs. Partial or reduced data is never "
+            "presented as the completed comparison; use 'jev-benchmark run-inspect' "
+            "to inspect a partial or pilot run"
+        )
+    return scope
 
 
 # --------------------------------------------------------------------------- #
@@ -434,6 +588,8 @@ def build_report(
     }
 
     return {
+        "scope": benchmark_scope(artifacts),
+        "manifest": artifacts.manifest,
         "run": {
             "run_id": state.run_id,
             "mode": state.mode,
@@ -508,14 +664,42 @@ def print_report(report: dict) -> None:
     """Print the report as human-readable tables (values only, no secrets)."""
     run = report["run"]
     data = report["dataset"]
+    scope = report.get("scope", {})
+    official_scope = bool(scope.get("is_completed_official_benchmark", False))
     print(f"Benchmark report - run {run['run_id']} (mode {run['mode']}, status {run['status']})")
+    if not official_scope:
+        print()
+        print("*** NON-OFFICIAL / REDUCED SCOPE - NOT THE COMPLETED BENCHMARK ***")
+        if scope.get("reason"):
+            print(f"  reason: {scope['reason']}")
+        print(
+            f"  this report covers {scope.get('planned_rows')} rows x "
+            f"{len(run['model_ids'])} providers = {scope.get('planned_pairs')} of "
+            f"{scope.get('official_planned_pairs')} official planned row-provider pairs"
+        )
+        print(
+            "  a partial, pilot or reduced run must never be presented as the "
+            "completed benchmark comparison"
+        )
+        print()
     print(f"  completed row-provider pairs : {run['completed_pairs']}/{run['planned_pairs']}")
     print(f"  config hash                  : {run['config_hash']}")
     print(f"  ordered-record sha256        : {run['ordered_record_sha256']}")
-    population = (
-        "official UCI population" if data["is_official_population"]
-        else "NON-OFFICIAL local CSV"
-    )
+    manifest = report.get("manifest")
+    if manifest:
+        print(
+            f"  artifact manifest            : {manifest['files_verified']} files "
+            f"verified (sha256 + bytes) against {Path(manifest['path']).name}"
+        )
+    if not data["is_official_population"]:
+        population = "NON-OFFICIAL local CSV"
+    elif official_scope:
+        population = "official UCI population"
+    else:
+        population = (
+            f"official {data['row_count']}-row CSV "
+            "(reduced/non-'run' scope; NOT the completed benchmark)"
+        )
     print(
         f"  dataset                      : {data['row_count']} rows "
         f"({population}), "
@@ -672,8 +856,8 @@ def print_report(report: dict) -> None:
             if values.get("n"):
                 print(
                     f"  {model}: Brier {values['brier']:.4f} (n={values['n']}), "
-                    f"mean P(high) when gold high {values['mean_p_high_when_gold_high']:.4f} "
-                    f"vs when gold other {values['mean_p_high_when_gold_other']:.4f}"
+                    f"mean P(high) when gold high {_pct(values['mean_p_high_when_gold_high'])} "
+                    f"vs when gold other {_pct(values['mean_p_high_when_gold_other'])}"
                 )
             else:
                 print(f"  {model}: no reported stage-1 probabilities")

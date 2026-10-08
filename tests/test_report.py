@@ -8,6 +8,7 @@ milestone's suite stays runnable; the results milestone requires them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -126,6 +127,20 @@ def write_data_dir(tmp_path: Path) -> Path:
     return data_dir
 
 
+def write_manifest(run_dir: Path, files: dict, **extra) -> Path:
+    manifest = {"description": "test manifest", "files": files, **extra}
+    path = run_dir / "MANIFEST.json"
+    path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return path
+
+
+def manifest_entry(raw: bytes, *, size_delta: int = 0, sha: str | None = None) -> dict:
+    return {
+        "bytes": len(raw) + size_delta,
+        "sha256": sha if sha is not None else hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def journal_entry(row: int, model: str, stage: str, choice: str) -> dict:
     return {
         "row_index": row,
@@ -223,6 +238,195 @@ def test_config_identity_mismatch_is_refused(tmp_path, small_dataset):
 
 
 # --------------------------------------------------------------------------- #
+# Official-population scope gate.
+# --------------------------------------------------------------------------- #
+
+def test_reduced_scope_is_refused(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    artifacts = report_mod.load_run_artifacts(run_dir)
+    with pytest.raises(ReportInputError, match="official"):
+        report_mod.verify_official_scope(artifacts)
+
+
+def test_pilot_mode_is_refused(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    state = json.loads((run_dir / "run.json").read_text())
+    state["mode"] = "pilot"
+    (run_dir / "run.json").write_text(json.dumps(state))
+    artifacts = report_mod.load_run_artifacts(run_dir)
+    with pytest.raises(ReportInputError, match="mode"):
+        report_mod.verify_official_scope(artifacts)
+
+
+def test_scope_flags_a_doctored_planned_pairs_header(small_dataset, tmp_path):
+    """A subset whose header is made self-consistent is still a reduced scope."""
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    artifacts = report_mod.load_run_artifacts(run_dir)
+    scope = report_mod.benchmark_scope(artifacts)
+    assert scope["is_completed_official_benchmark"] is False
+    assert scope["planned_rows"] == 5
+    assert scope["official_planned_pairs"] == 3042
+    assert scope["reason"]
+
+
+@pytest.mark.skipif(
+    not PUBLISHED_READY,
+    reason="published/ artifacts are committed in the results milestone",
+)
+def test_doctored_published_subset_is_refused(tmp_path, monkeypatch, capsys):
+    """A 100-row, planned_pairs=300 subset of published/ is refused, not reported."""
+    import shutil
+
+    dst = tmp_path / "subset"
+    shutil.copytree(PUBLISHED_DIR, dst)
+    (dst / "MANIFEST.json").unlink()  # test the scope gate, not the manifest gate
+    state = json.loads((dst / "run.json").read_text())
+    state["planned_row_indices"] = list(range(100))
+    (dst / "run.json").write_text(json.dumps(state, indent=2) + "\n")
+    kept = [
+        line for line in (dst / "cases.jsonl").read_text().splitlines()
+        if line.strip() and json.loads(line)["row_index"] < 100
+    ]
+    (dst / "cases.jsonl").write_text("\n".join(kept) + "\n")
+
+    monkeypatch.chdir(REPO_ROOT)
+    rc = cli.main(["report", "--from", str(dst), "--data-dir", "data", "--n-boot", "20"])
+    assert rc != 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "official" in captured.err.lower()
+    assert "100" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# MANIFEST.json integrity.
+# --------------------------------------------------------------------------- #
+
+def test_manifest_absent_is_skipped(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    artifacts = report_mod.load_run_artifacts(run_dir)
+    assert artifacts.manifest is None
+
+
+def test_manifest_consistent_files_are_verified(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    write_manifest(run_dir, {
+        "run.json": manifest_entry((run_dir / "run.json").read_bytes()),
+        "cases.jsonl": manifest_entry((run_dir / "cases.jsonl").read_bytes()),
+    }, run_id="run-test")
+    artifacts = report_mod.load_run_artifacts(run_dir)
+    assert artifacts.manifest["files_verified"] == 2
+
+
+def test_manifest_size_mismatch_is_refused(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    raw = (run_dir / "cases.jsonl").read_bytes()
+    write_manifest(run_dir, {"cases.jsonl": manifest_entry(raw, size_delta=1)})
+    with pytest.raises(ReportInputError, match="bytes"):
+        report_mod.load_run_artifacts(run_dir)
+
+
+def test_manifest_hash_mismatch_is_refused(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    raw = (run_dir / "cases.jsonl").read_bytes()
+    write_manifest(run_dir, {"cases.jsonl": manifest_entry(raw, sha="0" * 64)})
+    with pytest.raises(ReportInputError, match="sha256"):
+        report_mod.load_run_artifacts(run_dir)
+
+
+def test_manifest_missing_listed_file_is_refused(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    write_manifest(run_dir, {"absent.json": {"bytes": 1, "sha256": "0" * 64}})
+    with pytest.raises(ReportInputError, match="missing"):
+        report_mod.load_run_artifacts(run_dir)
+
+
+def test_manifest_identity_mismatch_is_refused(small_dataset, tmp_path):
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    write_manifest(run_dir, {
+        "cases.jsonl": manifest_entry((run_dir / "cases.jsonl").read_bytes()),
+    }, run_id="a-different-run")
+    with pytest.raises(ReportInputError, match="run_id"):
+        report_mod.load_run_artifacts(run_dir)
+
+
+# --------------------------------------------------------------------------- #
+# None-valued optional display fields.
+# --------------------------------------------------------------------------- #
+
+def test_exploratory_calibration_none_when_a_gold_class_absent(small_dataset):
+    cases = full_small_cases(small_dataset)
+    labels = {r.index: r.label for r in small_dataset.records}
+
+    def entry(row: int, gold: str) -> dict:
+        return {
+            "row_index": row,
+            "requested_model": MODELS[0],
+            "stage": "stage1",
+            "decision": {
+                "stage": "stage1",
+                "requested_model": MODELS[0],
+                "actual_model": MODELS[0],
+                "choice": "other" if gold != "high risk" else "high",
+                "confidence": 0.5,
+                "probabilities": {"high": 0.3, "other": 0.7},
+                "usage": {"input_tokens": 10, "output_tokens": 5, "cost": None},
+            },
+            "attempts": [],
+        }
+
+    only_other = [
+        entry(c.row_index, labels[c.row_index])
+        for c in cases
+        if c.requested_model == MODELS[0] and labels[c.row_index] != "high risk"
+    ]
+    assert only_other  # the fixture has non-high rows
+    calib = report_mod.exploratory_calibration(only_other, cases)
+    prov = calib["providers"][MODELS[0]]
+    assert prov["n"] == len(only_other)
+    assert prov["mean_p_high_when_gold_high"] is None
+    assert prov["mean_p_high_when_gold_other"] is not None
+
+    only_high = [
+        entry(c.row_index, labels[c.row_index])
+        for c in cases
+        if c.requested_model == MODELS[0] and labels[c.row_index] == "high risk"
+    ]
+    calib_high = report_mod.exploratory_calibration(only_high, cases)
+    prov_high = calib_high["providers"][MODELS[0]]
+    assert prov_high["mean_p_high_when_gold_high"] is not None
+    assert prov_high["mean_p_high_when_gold_other"] is None
+
+
+def test_print_report_labels_none_probability_means(small_dataset, tmp_path, capsys):
+    """A provider with no stage-1 rows of one gold class prints 'n/a', not a crash."""
+    cases = full_small_cases(small_dataset)
+    run_dir = write_run_dir(tmp_path, small_dataset, cases)
+    artifacts = report_mod.load_run_artifacts(run_dir)
+    report_mod.verify_identity(artifacts, small_dataset)
+    report = report_mod.build_report(artifacts, small_dataset, n_boot=20, seed=1)
+    report["exploratory_calibration"]["providers"][MODELS[0]] = {
+        "n": 3,
+        "brier": 0.25,
+        "mean_p_high_when_gold_high": None,
+        "mean_p_high_when_gold_other": 0.4,
+        "rows_without_reported_probabilities": 0,
+    }
+    report_mod.print_report(report)  # must not raise
+    out = capsys.readouterr().out
+    assert "n/a" in out
+
+
+# --------------------------------------------------------------------------- #
 # Stage journal gating verification.
 # --------------------------------------------------------------------------- #
 
@@ -313,7 +517,8 @@ def test_report_is_json_serializable(tmp_path, small_dataset):
 # CLI report command (offline; no keys, no paid calls).
 # --------------------------------------------------------------------------- #
 
-def test_cli_report_from_synthetic_run(tmp_path, small_dataset, capsys, monkeypatch):
+def test_cli_report_refuses_reduced_run(tmp_path, small_dataset, capsys, monkeypatch):
+    """A reduced, self-consistent artifact set is never presented as complete."""
     cases = full_small_cases(small_dataset)
     run_dir = write_run_dir(tmp_path, small_dataset, cases)
     write_data_dir(tmp_path)
@@ -322,11 +527,11 @@ def test_cli_report_from_synthetic_run(tmp_path, small_dataset, capsys, monkeypa
         "report", "--from", str(run_dir), "--data-dir", "data",
         "--n-boot", "100",
     ])
-    assert rc == 0
-    out = capsys.readouterr().out
-    for model in MODELS:
-        assert model in out
-    assert "run-test" in out
+    assert rc != 0
+    captured = capsys.readouterr()
+    assert captured.out == ""  # no partial table is printed before refusing
+    assert "official" in captured.err.lower()
+    assert "run-inspect" in captured.err
 
 
 def test_cli_report_missing_dir_fails_clearly(tmp_path, monkeypatch, capsys):
@@ -337,19 +542,22 @@ def test_cli_report_missing_dir_fails_clearly(tmp_path, monkeypatch, capsys):
     assert "report" in err.lower()
 
 
-def test_cli_report_writes_optional_json(tmp_path, small_dataset, monkeypatch, capsys):
-    cases = full_small_cases(small_dataset)
-    run_dir = write_run_dir(tmp_path, small_dataset, cases)
-    write_data_dir(tmp_path)
+@pytest.mark.skipif(
+    not PUBLISHED_READY,
+    reason="published/ artifacts are committed in the results milestone",
+)
+def test_cli_report_writes_optional_json_for_official_run(tmp_path, monkeypatch, capsys):
     out_path = tmp_path / "report.json"
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(REPO_ROOT)
     rc = cli.main([
-        "report", "--from", str(run_dir), "--data-dir", "data",
+        "report", "--from", "published", "--data-dir", "data",
         "--n-boot", "50", "--out", str(out_path),
     ])
     assert rc == 0
     saved = json.loads(out_path.read_text())
-    assert saved["run"]["planned_pairs"] == 15
+    assert saved["run"]["planned_pairs"] == 3042
+    assert saved["scope"]["is_completed_official_benchmark"] is True
+    assert saved["manifest"]["files_verified"] == 5
 
 
 # --------------------------------------------------------------------------- #
@@ -389,7 +597,9 @@ class TestPublishedArtifacts:
         monkeypatch.chdir(REPO_ROOT)
         rc = cli.main(["report", "--from", "published", "--data-dir", "data", "--n-boot", "200"])
         assert rc == 0
-        assert capsys.readouterr().out  # a human-readable report was printed
+        out = capsys.readouterr().out  # a human-readable report was printed
+        assert "official UCI population" in out
+        assert "5 files verified" in out
 
         dataset = prepare_dataset(source=REPO_ROOT / "data" / "raw" / "maternal_health_risk.csv")
         artifacts = report_mod.load_run_artifacts(PUBLISHED_DIR)
@@ -414,6 +624,32 @@ class TestPublishedArtifacts:
         for marker in ("TYPESAFE_API_KEY", "OPENROUTER_API_KEY", "Authorization",
                        "Bearer", "api_key", "sk-"):
             assert marker not in blob, f"secret-like marker {marker!r} found in published/"
+
+    def test_modified_published_artifact_is_refused(self, tmp_path, monkeypatch, capsys):
+        """A tampered published/ file fails the MANIFEST SHA-256/size check."""
+        import shutil
+
+        dst = tmp_path / "published"
+        shutil.copytree(PUBLISHED_DIR, dst)
+        with (dst / "cases.jsonl").open("ab") as handle:
+            handle.write(b" \n")
+        monkeypatch.chdir(REPO_ROOT)
+        rc = cli.main(["report", "--from", str(dst), "--data-dir", "data", "--n-boot", "20"])
+        assert rc != 0
+        assert "MANIFEST" in capsys.readouterr().err
+
+    def test_tampered_published_manifest_is_refused(self, tmp_path, monkeypatch, capsys):
+        import shutil
+
+        dst = tmp_path / "published"
+        shutil.copytree(PUBLISHED_DIR, dst)
+        manifest = json.loads((dst / "MANIFEST.json").read_text())
+        manifest["files"]["cases.jsonl"]["sha256"] = "0" * 64
+        (dst / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        monkeypatch.chdir(REPO_ROOT)
+        rc = cli.main(["report", "--from", str(dst), "--data-dir", "data", "--n-boot", "20"])
+        assert rc != 0
+        assert "sha256" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(
